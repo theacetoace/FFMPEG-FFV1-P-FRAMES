@@ -139,6 +139,57 @@ static inline int pix_abs16_c(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
     return s;
 }
 
+static inline int pix_median_abs16_c(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+                             ptrdiff_t stride, int h)
+{
+    int s = 0, i;
+    
+    s    += abs(pix1[0] - 0);
+    s    += abs(pix1[1] - pix2[0]);
+    s    += abs(pix1[2] - pix2[1]);
+    s    += abs(pix1[3] - pix2[2]);
+    s    += abs(pix1[4] - pix2[3]);
+    s    += abs(pix1[5] - pix2[4]);
+    s    += abs(pix1[6] - pix2[5]);
+    s    += abs(pix1[7] - pix2[6]);
+    s    += abs(pix1[8]  - pix2[7]);
+    s    += abs(pix1[9]  - pix2[8]);
+    s    += abs(pix1[10] - pix2[9]);
+    s    += abs(pix1[11] - pix2[10]);
+    s    += abs(pix1[12] - pix2[11]);
+    s    += abs(pix1[13] - pix2[12]);
+    s    += abs(pix1[14] - pix2[13]);
+    s    += abs(pix1[15] - pix2[14]);
+    pix1 += stride;
+    pix2 += stride;
+
+    for (i = 1; i < h; i++) {
+        if (i == 1)
+            s    += abs(pix1[0] - mid_pred(pix2[-stride + 15], pix2[-stride + 15] + pix2[-stride + 0] - pix2[-stride + 0], pix2[-stride + 0]));
+        else
+            s    += abs(pix1[0] - mid_pred(pix2[-stride + 15], pix2[-stride + 15] + pix2[-stride + 0] - pix2[-2 * stride + 15], pix2[-stride + 0]));
+        s    += abs(pix1[1] - mid_pred(pix2[0], pix2[0] + pix2[-stride + 1] - pix2[-stride + 0], pix1[-stride + 1]));
+        s    += abs(pix1[2] - mid_pred(pix2[1], pix2[1] + pix1[-stride + 2] - pix2[-stride + 1], pix1[-stride + 2]));
+        s    += abs(pix1[3] - mid_pred(pix2[2], pix2[2] + pix1[-stride + 3] - pix2[-stride + 2], pix1[-stride + 3]));
+        s    += abs(pix1[4] - mid_pred(pix2[3], pix2[3] + pix1[-stride + 4] - pix2[-stride + 3], pix1[-stride + 4]));
+        s    += abs(pix1[5] - mid_pred(pix2[4], pix2[4] + pix1[-stride + 5] - pix2[-stride + 4], pix1[-stride + 5]));
+        s    += abs(pix1[6] - mid_pred(pix2[5], pix2[5] + pix1[-stride + 6] - pix2[-stride + 5], pix1[-stride + 6]));
+        s    += abs(pix1[7] - mid_pred(pix2[6], pix2[6] + pix1[-stride + 7] - pix2[-stride + 6], pix1[-stride + 7]));
+        s    += abs(pix1[8] - mid_pred(pix2[7], pix2[7] + pix1[-stride + 8] - pix2[-stride + 7], pix1[-stride + 8]));
+        s    += abs(pix1[9] - mid_pred(pix2[8], pix2[8] + pix1[-stride + 9] - pix2[-stride + 8], pix1[-stride + 9]));
+        s    += abs(pix1[10] - mid_pred(pix2[9], pix2[9] + pix1[-stride + 10] - pix2[-stride + 9], pix1[-stride + 10]));
+        s    += abs(pix1[11] - mid_pred(pix2[10], pix2[10] + pix1[-stride + 11] - pix2[-stride + 10], pix1[-stride + 11]));
+        s    += abs(pix1[12] - mid_pred(pix2[11], pix2[11] + pix1[-stride + 12] - pix2[-stride + 11], pix1[-stride + 12]));
+        s    += abs(pix1[13] - mid_pred(pix2[12], pix2[12] + pix1[-stride + 13] - pix2[-stride + 12], pix1[-stride + 13]));
+        s    += abs(pix1[14] - mid_pred(pix2[13], pix2[13] + pix1[-stride + 14] - pix2[-stride + 13], pix1[-stride + 14]));
+        s    += abs(pix1[15] - mid_pred(pix2[14], pix2[14] + pix1[-stride + 15] - pix2[-stride + 14], pix1[-stride + 15]));
+        pix1 += stride;
+        pix2 += stride;
+        
+    }
+    return s;
+}
+
 static int pix_abs16_x2_c(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
                           ptrdiff_t stride, int h)
 {
@@ -243,6 +294,41 @@ static inline int pix_abs8_c(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
         s    += abs(pix1[7] - pix2[7]);
         pix1 += stride;
         pix2 += stride;
+    }
+    return s;
+}
+
+static inline int pix_median_abs8_c(MpegEncContext *v, uint8_t *pix1, uint8_t *pix2,
+                             ptrdiff_t stride, int h)
+{
+    int s = 0, i;
+    
+    s    += abs(pix1[0] - 0);
+    s    += abs(pix1[1] - pix2[0]);
+    s    += abs(pix1[2] - pix2[1]);
+    s    += abs(pix1[3] - pix2[2]);
+    s    += abs(pix1[4] - pix2[3]);
+    s    += abs(pix1[5] - pix2[4]);
+    s    += abs(pix1[6] - pix2[5]);
+    s    += abs(pix1[7] - pix2[6]);
+    pix1 += stride;
+    pix2 += stride;
+
+    for (i = 1; i < h; i++) {
+        if (i == 1)
+            s    += abs(pix1[0] - mid_pred(pix2[-stride + 7], pix2[-stride + 7] + pix2[-stride + 0] - pix2[-stride + 0], pix2[-stride + 0]));
+        else
+            s    += abs(pix1[0] - mid_pred(pix2[-stride + 7], pix2[-stride + 7] + pix2[-stride + 0] - pix2[-2 * stride + 7], pix2[-stride + 0]));
+        s    += abs(pix1[1] - mid_pred(pix2[0], pix2[0] + pix2[-stride + 1] - pix2[-stride + 0], pix1[-stride + 1]));
+        s    += abs(pix1[2] - mid_pred(pix2[1], pix2[1] + pix1[-stride + 2] - pix2[-stride + 1], pix1[-stride + 2]));
+        s    += abs(pix1[3] - mid_pred(pix2[2], pix2[2] + pix1[-stride + 3] - pix2[-stride + 2], pix1[-stride + 3]));
+        s    += abs(pix1[4] - mid_pred(pix2[3], pix2[3] + pix1[-stride + 4] - pix2[-stride + 3], pix1[-stride + 4]));
+        s    += abs(pix1[5] - mid_pred(pix2[4], pix2[4] + pix1[-stride + 5] - pix2[-stride + 4], pix1[-stride + 5]));
+        s    += abs(pix1[6] - mid_pred(pix2[5], pix2[5] + pix1[-stride + 6] - pix2[-stride + 5], pix1[-stride + 6]));
+        s    += abs(pix1[7] - mid_pred(pix2[6], pix2[6] + pix1[-stride + 7] - pix2[-stride + 6], pix1[-stride + 7]));
+        pix1 += stride;
+        pix2 += stride;
+        
     }
     return s;
 }
@@ -377,6 +463,9 @@ void ff_set_cmp(MECmpContext *c, me_cmp_func *cmp, int type)
         switch (type & 0xFF) {
         case FF_CMP_SAD:
             cmp[i] = c->sad[i];
+            break;
+        case FF_CMP_MEDIAN_SAD:
+            cmp[i] = c->median_sad[i];
             break;
         case FF_CMP_SATD:
             cmp[i] = c->hadamard8_diff[i];
@@ -993,4 +1082,7 @@ av_cold void ff_me_cmp_init(MECmpContext *c, AVCodecContext *avctx)
         ff_me_cmp_init_x86(c, avctx);
     if (ARCH_MIPS)
         ff_me_cmp_init_mips(c, avctx);
+    
+    c->median_sad[0] = pix_median_abs16_c;
+    c->median_sad[1] = pix_median_abs8_c;
 }
