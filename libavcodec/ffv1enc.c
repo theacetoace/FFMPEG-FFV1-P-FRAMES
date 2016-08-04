@@ -1362,7 +1362,6 @@ static inline int get_penalty_factor(int lambda, int lambda2, int type){
     switch(type&0xFF){
     default:
     case FF_CMP_SAD:
-    case FF_CMP_MEDIAN_SAD:
         return lambda>>FF_LAMBDA_SHIFT;
     case FF_CMP_DCT:
         return (3*lambda)>>(FF_LAMBDA_SHIFT+1);
@@ -1379,6 +1378,7 @@ static inline int get_penalty_factor(int lambda, int lambda2, int type){
     case FF_CMP_NSSE:
         return lambda2>>FF_LAMBDA_SHIFT;
     case FF_CMP_BIT:
+    case FF_CMP_MEDIAN_SAD:
         return 1;
     }
 }
