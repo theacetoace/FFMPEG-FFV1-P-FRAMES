@@ -78,11 +78,6 @@ static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
         memset(f->c_image_line_buf, 0, 2 * width * sizeof(*f->c_image_line_buf));
 
         for (y = 0; y < h1; y++) {
-            /*memcpy(
-                f->p_image_line_buf + width,
-                f->c_image_line_buf + width,
-                width * sizeof(*f->p_image_line_buf)
-            );*/
             memset(f->p_image_line_buf, 0, width * sizeof(*f->p_image_line_buf));
             memset(f->c_image_line_buf, 0, width * sizeof(*f->c_image_line_buf));
             av_read_image_line(f->c_image_line_buf,
@@ -96,13 +91,6 @@ static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
                               desc,
                               0, y, i, w1, 0);
             for (x = 0; x < w1; ++x) {
-                /*uint16_t mid = mid_pred(
-                    x ? f->c_image_line_buf[width + x - 1] : 0,
-                    x ? f->p_image_line_buf[width + x - 1] : 0,
-                    f->p_image_line_buf[width + x]
-                );
-                f->c_image_line_buf[width + x] = (f->c_image_line_buf[x] + mid - (max_val >> 2)) & (max_val - 1);
-                f->c_image_line_buf[x] = f->c_image_line_buf[width + x] + f->p_image_line_buf[x];*/
                 f->c_image_line_buf[x] = (f->c_image_line_buf[x] + f->p_image_line_buf[x] - (max_val >> 2)) & (max_val - 1);
             }
             av_write_image_line(f->c_image_line_buf,
@@ -935,6 +923,9 @@ static int read_header(FFV1Context *f)
         av_log(f->avctx, AV_LOG_ERROR, "format not supported\n");
         return AVERROR(ENOSYS);
     }
+    
+    ff_ffv1_nlm_init(f);
+    
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->avctx->pix_fmt);
     f->nb_planes = 0;
     for (i = 0; i < desc->nb_components; i++)
@@ -1287,6 +1278,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
             //av_frame_copy(f->picture.f, f->current_picture);
         }
         av_frame_copy(f->current_picture, f->picture.f);
+        ff_ffv1_filter_frame(f, f->current_picture);
     }
     ff_ffv1_release_buffer(avctx);
 
@@ -1361,6 +1353,8 @@ static int init_thread_copy(AVCodecContext *avctx)
 
     f->p_image_line_buf = av_mallocz_array(sizeof(*f->p_image_line_buf), 2 * f->width);
     f->c_image_line_buf = av_mallocz_array(sizeof(*f->c_image_line_buf), 2 * f->width);
+    
+    ff_ffv1_nlm_init(f);
 
     if (!f->p_image_line_buf || !f->c_image_line_buf)
         goto fail;
@@ -1408,7 +1402,7 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 {
     FFV1Context *fsrc = src->priv_data;
     FFV1Context *fdst = dst->priv_data;
-    int i, j, ret;
+    int i, c, j, ret;
 
     if (dst == src)
         return 0;
@@ -1417,6 +1411,7 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
         ThreadFrame picture = fdst->picture, last_picture = fdst->last_picture, residual = fdst->residual;
         uint16_t *c_image_line_buf = fdst->c_image_line_buf, *p_image_line_buf = fdst->p_image_line_buf;
         uint8_t (*initial_states[MAX_QUANT_TABLES])[32];
+        NLMContext nlm = fdst->nlm;
         struct FFV1Context *slice_context[MAX_SLICES];
         memcpy(initial_states, fdst->initial_states, sizeof(fdst->initial_states));
         memcpy(slice_context,  fdst->slice_context , sizeof(fdst->slice_context));
@@ -1438,6 +1433,22 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 
         fdst->p_image_line_buf = p_image_line_buf;
         fdst->c_image_line_buf = c_image_line_buf;
+        
+        fdst->nlm = nlm;
+        
+        for (i = 0; i < MAX_NLMeansImages; i++) {
+            fdst->nlm.image_available[i] = fsrc->nlm.image_available[i];
+            
+            for (c = 0; c < 3; c++) {
+                const int out_total_height = (fsrc->nlm.images[i].plane[c].h+2*fsrc->nlm.images[i].plane[c].border);
+                
+                memcpy(
+                    fdst->nlm.images[i].plane[c].mem_start, 
+                    fsrc->nlm.images[i].plane[c].mem_start,
+                    fsrc->nlm.images[i].plane[c].stride*out_total_height*sizeof(uint16_t)
+                );
+            }
+        }
 
         fdst->current_picture   = current_picture;
         fdst->mconly_picture    = mconly_picture;

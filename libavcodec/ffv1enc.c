@@ -181,11 +181,6 @@ static int ff_frame_diff(FFV1Context *f, const AVFrame *pict)
         memset(f->c_image_line_buf, 0, 2 * width * sizeof(*f->c_image_line_buf));
 
         for (y = 0; y < h1; y++) {
-            /*memcpy(
-                f->p_image_line_buf + width,
-                f->c_image_line_buf + width,
-                width * sizeof(*f->p_image_line_buf)
-            );*/
             memset(f->p_image_line_buf, 0, width * sizeof(*f->p_image_line_buf));
             memset(f->c_image_line_buf, 0, width * sizeof(*f->c_image_line_buf));
             av_read_image_line(f->c_image_line_buf,
@@ -199,13 +194,6 @@ static int ff_frame_diff(FFV1Context *f, const AVFrame *pict)
                               desc,
                               0, y, i, w1, 0);
             for (x = 0; x < w1; ++x) {
-                /*uint16_t mid = mid_pred(
-                    x ? f->c_image_line_buf[width + x - 1] : 0,
-                    x ? f->p_image_line_buf[width + x - 1] : 0,
-                    f->p_image_line_buf[width + x]
-                );
-                f->c_image_line_buf[width + x] = f->c_image_line_buf[x] - f->p_image_line_buf[x];
-                f->c_image_line_buf[x] = (f->c_image_line_buf[width + x] - mid + (max_val >> 2)) & (max_val - 1);*/
                 f->c_image_line_buf[x] = (f->c_image_line_buf[x] - f->p_image_line_buf[x] + (max_val >> 2)) & (max_val - 1);
             }
             av_write_image_line(f->c_image_line_buf, //CHANGED
@@ -807,7 +795,8 @@ static av_cold int encode_init(AVCodecContext *avctx)
 
     if ((ret = ff_ffv1_common_init(avctx)) < 0)
         return ret;
-
+        
+    ff_ffv1_nlm_init(s);
     ff_mpegvideoencdsp_init(&s->mpvencdsp, avctx);
 
     ff_ffv1_alloc_blocks(s);
@@ -1377,8 +1366,8 @@ static inline int get_penalty_factor(int lambda, int lambda2, int type){
     case FF_CMP_SSE:
     case FF_CMP_NSSE:
         return lambda2>>FF_LAMBDA_SHIFT;
-    case FF_CMP_BIT:
     case FF_CMP_MEDIAN_SAD:
+    case FF_CMP_BIT:
         return 1;
     }
 }
@@ -2609,6 +2598,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
             //av_frame_copy(f->picture.f, f->current_picture);
             av_frame_copy(f->current_picture, pict);
         }
+        
+        ff_ffv1_filter_frame(f, f->current_picture);
 
         ff_ffv1_release_buffer(avctx);
 
