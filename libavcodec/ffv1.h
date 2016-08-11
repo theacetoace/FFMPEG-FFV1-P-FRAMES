@@ -134,45 +134,6 @@ static const BlockNode null_block= { //FIXME add border maybe
 #define LOG2_MB_SIZE 4
 #define MB_SIZE (1<<LOG2_MB_SIZE)
 
-#define MAX_NLMeansImages 32
-
-typedef struct
-{
-    uint16_t* img; // point to logical origin (0;0)
-    int stride;
-
-    int w,h;
-    int border; // extra border on all four sides
-
-    uint16_t* mem_start; // start of allocated memory
-} MonoImage;
-
-typedef struct
-{
-    MonoImage   plane[3];
-} ColorImage;
-
-struct PixelSum
-{
-    float weight_sum;
-    float pixel_sum;
-};
-
-typedef struct {
-    double h_param;
-    int    patch_size;
-    int    range;      // search range (must be odd number)
-    int    n_frames;   // temporal search depth
-    
-    int hsub, vsub;
-    
-    struct PixelSum *tmp_data;
-    uint32_t *integral_mem;
-
-    ColorImage images[MAX_NLMeansImages];
-    int     image_available[MAX_NLMeansImages];
-} NLMContext;
-
 #define MAX_SLICES 256
 
 typedef struct FFV1Context {
@@ -286,8 +247,6 @@ typedef struct FFV1Context {
     IDWTELEM *spatial_idwt_buffer;
     
     int nb_planes;
-    
-    NLMContext nlm;
 
 } FFV1Context;
 
@@ -312,8 +271,6 @@ int ff_ffv1_frame_start(FFV1Context *s);
 void ff_ffv1_pred_block(FFV1Context *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,
                      int sx, int sy, int b_w, int b_h, const BlockNode *block,
                      int plane_index, int w, int h);
-void ff_ffv1_filter_frame(FFV1Context *f, AVFrame *frame);
-int ff_ffv1_nlm_init(FFV1Context *f);
 
 static inline void pred_mv(FFV1Context *s, int *mx, int *my, int ref,
                            const BlockNode *left, const BlockNode *top, const BlockNode *tr){
