@@ -1,3 +1,24 @@
+/*
+ * Copyright (C) 2004 Michael Niedermayer <michaelni@gmx.at>
+ * Copyright (C) 2006 Robert Edele <yartrebo@earthlink.net>
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
 #ifndef AVCODEC_OBMC_H
 #define AVCODEC_OBMC_H
 
@@ -28,11 +49,11 @@
 #define LOG2_OBMC_MAX 8
 #define OBMC_MAX (1<<(LOG2_OBMC_MAX))
 typedef struct BlockNode{
-    int16_t mx;
-    int16_t my;
-    uint8_t ref;
-    uint8_t color[3];
-    uint8_t type;
+    int16_t mx;         ///< Motion vector component X, see mv_scale
+    int16_t my;         ///< Motion vector component Y, see mv_scale
+    uint8_t ref;        ///< Reference frame index
+    uint8_t color[3];   ///< Color for intra
+    uint8_t type;       ///< Bitfield of BLOCK_*
 //#define TYPE_SPLIT    1
 #define BLOCK_INTRA   1
 #define BLOCK_OPT     2
