@@ -120,7 +120,7 @@ const int8_t ff_quant3bA[256]={
  1,-1, 1,-1, 1,-1, 1,-1, 1,-1, 1,-1, 1,-1, 1,-1,
 };
 
-const uint8_t * const ff_ffv1_obmc_tab[4]= {
+const uint8_t * const ff_obmc_tab[4]= {
     obmc32, obmc16, obmc8, obmc4
 };
 

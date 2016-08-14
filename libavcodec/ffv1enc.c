@@ -626,7 +626,7 @@ static void write_p_header(FFV1Context *f)
     }
     if (!f->key_frame) { //FIXME update_mc
         for(plane_index=0; plane_index<FFMIN(f->obmc.nb_planes, 2); plane_index++){
-            Plane *p= &f->obmc.plane[plane_index];
+            PlaneObmc *p= &f->obmc.plane[plane_index];
             put_rac(c, state, p->diag_mc);
             put_symbol(c, state, p->htaps/2-1, 0);
             for(i= p->htaps/2; i; i--)
@@ -944,6 +944,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
         for (i = 1; i < 256; i++)
             s->state_transition[i] = c.one_state[i];
     }
+    
+    if (avctx->width % 16 || avctx->height % 16) {
+        s->p_frame = 0;
+    }
 
     for (i = 0; i < 256; i++) {
         s->quant_table_count = 2;
@@ -1129,6 +1133,7 @@ slices_ok:
     
     obmc_encode_init(&s->obmc, avctx);
     s->obmc.c = &s->slice_context[0]->c;
+    s->obmc.put_symbol = put_symbol;
 
     return 0;
 }
@@ -1449,10 +1454,20 @@ FF_ENABLE_DEPRECATION_WARNINGS
         write_p_header(f);
         //*c = tmp;
         
-        obmc_encode_frame(&f->obmc, avctx, pict);
+        f->obmc.m.pict_type = pic->pict_type = f->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
+        
+        obmc_pre_encode_frame(&f->obmc, avctx, pict);
+        
+        ff_obmc_common_init_after_header(&f->obmc);
+
+        f->obmc.m.misc_bits = 8*(c->bytestream - c->bytestream_start);
+        //tmp = f->c;
+        obmc_encode_blocks(&f->obmc, 1);
+        //*f->c = tmp;
+        f->obmc.m.mv_bits = 8*(c->bytestream - c->bytestream_start) - f->obmc.m.misc_bits;
 
         for(plane_index=0; plane_index < f->obmc.nb_planes; plane_index++){
-            Plane *p= &f->obmc.plane[plane_index];
+            PlaneObmc *p= &f->obmc.plane[plane_index];
             int w= p->width;
             int h= p->height;
 
@@ -1609,6 +1624,8 @@ static const AVCodecDefault ffv1_defaults[] = {
     { "coder", "-1" },
     { "me_method", "iter" },
     { "flags", "+qpel+mv4" },
+    { "cmp", "msad" },
+    { "subcmp", "msad" },
     { NULL },
 };
 #endif

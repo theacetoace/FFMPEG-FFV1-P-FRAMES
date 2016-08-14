@@ -1,7 +1,11 @@
 #ifndef AVCODEC_OBMC_H
 #define AVCODEC_OBMC_H
 
+#include "libavutil/imgutils.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/motion_vector.h"
+
+#include "rangecoder.h"
 
 #include "hpeldsp.h"
 #include "me_cmp.h"
@@ -11,7 +15,6 @@
 #define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(OBMCContext, m))
 #include "mpegvideo.h"
 #include "h264qpel.h"
-
 
 #define MID_STATE 128
 
@@ -51,31 +54,9 @@ static const BlockNode null_block= { //FIXME add border maybe
 #define ENCODER_EXTRA_BITS 4
 #define HTAPS_MAX 8
 
-typedef struct x_and_coeff{
-    int16_t x;
-    uint16_t coeff;
-} x_and_coeff;
-
-typedef struct SubBand{
-    int level;
-    int stride;
+typedef struct PlaneObmc{
     int width;
     int height;
-    int qlog;        ///< log(qscale)/log[2^(1/6)]
-    DWTELEM *buf;
-    IDWTELEM *ibuf;
-    int buf_x_offset;
-    int buf_y_offset;
-    int stride_line; ///< Stride measured in lines, not pixels.
-    x_and_coeff * x_coeff;
-    struct SubBand *parent;
-    uint8_t state[/*7*2*/ 7 + 512][32];
-}SubBand;
-
-typedef struct Plane{
-    int width;
-    int height;
-    SubBand band[MAX_DECOMPOSITIONS][4];
 
     int htaps;
     int8_t hcoeff[HTAPS_MAX/2];
@@ -85,13 +66,16 @@ typedef struct Plane{
     int last_htaps;
     int8_t last_hcoeff[HTAPS_MAX/2];
     int last_diag_mc;
-} Plane;
+} PlaneObmc;
 
 typedef struct OBMCContext {
     AVCodecContext *avctx;
     RangeCoder *c;
     int key_frame;
     int chroma_h_shift, chroma_v_shift;
+    
+    int (*get_symbol)(RangeCoder *, uint8_t *, int );
+    void (*put_symbol)(RangeCoder *, uint8_t *, int, int);
     
     /* ME/MC part */
     MECmpContext mecc;
@@ -128,6 +112,7 @@ typedef struct OBMCContext {
     int b_width;
     int b_height;
     int block_max_depth;
+    int last_block_max_depth;
 
     uint32_t *ref_scores[MAX_REF_FRAMES];
     int16_t (*ref_mvs[MAX_REF_FRAMES])[2];
@@ -136,11 +121,12 @@ typedef struct OBMCContext {
     unsigned me_cache[ME_CACHE_SIZE];
     unsigned me_cache_generation;
     int mv_scale;
+    int last_mv_scale;
     int iterative_dia_size;
 
     IDWTELEM *spatial_idwt_buffer;
     
-    Plane plane[MAX_PLANES];
+    PlaneObmc plane[MAX_PLANES];
     
     int nb_planes;
 } OBMCContext;
@@ -157,7 +143,7 @@ int ff_obmc_frame_start(OBMCContext *f);
 int ff_obmc_alloc_blocks(OBMCContext *s);
 void ff_obmc_reset_contexts(OBMCContext *s);
 int ff_obmc_common_init(OBMCContext *s, AVCodecContext *avctx);
-int ff_obmc_close(AVCodecContext *avctx);
+int ff_obmc_close(OBMCContext *s);
 void ff_obmc_pred_block(OBMCContext *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,
                      int sx, int sy, int b_w, int b_h, const BlockNode *block,
                      int plane_index, int w, int h);
@@ -311,7 +297,7 @@ static av_always_inline void add_yblock(OBMCContext *s, int sliced, slice_buffer
 }
 
 static av_always_inline void predict_slice(OBMCContext *s, IDWTELEM *buf, int plane_index, int add, int mb_y){
-    Plane *p= &s->plane[plane_index];
+    PlaneObmc *p= &s->plane[plane_index];
     const int mb_w= s->b_width  << s->block_max_depth;
     const int mb_h= s->b_height << s->block_max_depth;
     int x, y, mb_x;
@@ -359,6 +345,84 @@ static av_always_inline void predict_slice(OBMCContext *s, IDWTELEM *buf, int pl
                    mb_x - 1, mb_y - 1,
                    add, 1, plane_index);
     }
+}
+
+static av_always_inline void predict_slice_buffered(OBMCContext *s, slice_buffer * sb, IDWTELEM * old_buffer, int plane_index, int add, int mb_y){
+    PlaneObmc *p= &s->plane[plane_index];
+    const int mb_w= s->b_width  << s->block_max_depth;
+    const int mb_h= s->b_height << s->block_max_depth;
+    int x, y, mb_x;
+    int block_size = MB_SIZE >> s->block_max_depth;
+    int block_w    = plane_index ? block_size>>s->chroma_h_shift : block_size;
+    int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
+    const uint8_t *obmc  = plane_index ? ff_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_obmc_tab[s->block_max_depth];
+    int obmc_stride= plane_index ? (2*block_size)>>s->chroma_h_shift : 2*block_size;
+    int ref_stride= s->current_picture->linesize[plane_index];
+    uint8_t *dst8= s->current_picture->data[plane_index];
+    int w= p->width;
+    int h= p->height;
+
+    if(s->key_frame || (s->avctx->debug&512)){
+        if(mb_y==mb_h)
+            return;
+
+        if(add){
+            for(y=block_h*mb_y; y<FFMIN(h,block_h*(mb_y+1)); y++){
+                IDWTELEM * line = sb->line[y];
+                for(x=0; x<w; x++){
+                    int v= line[x] + (128<<FRAC_BITS) + (1<<(FRAC_BITS-1));
+                    v >>= FRAC_BITS;
+                    if(v&(~255)) v= ~(v>>31);
+                    dst8[x + y*ref_stride]= v;
+                }
+            }
+        }else{
+            for(y=block_h*mb_y; y<FFMIN(h,block_h*(mb_y+1)); y++){
+                IDWTELEM * line = sb->line[y];
+                for(x=0; x<w; x++){
+                    line[x] -= 128 << FRAC_BITS;
+                }
+            }
+        }
+
+        return;
+    }
+
+    for(mb_x=0; mb_x<=mb_w; mb_x++){
+        add_yblock(s, 1, sb, old_buffer, dst8, obmc,
+                   block_w*mb_x - block_w/2,
+                   block_h*mb_y - block_h/2,
+                   block_w, block_h,
+                   w, h,
+                   w, ref_stride, obmc_stride,
+                   mb_x - 1, mb_y - 1,
+                   add, 0, plane_index);
+    }
+
+    if(s->avmv && mb_y < mb_h && plane_index == 0)
+        for(mb_x=0; mb_x<mb_w; mb_x++){
+            AVMotionVector *avmv = s->avmv + s->avmv_index;
+            const int b_width = s->b_width  << s->block_max_depth;
+            const int b_stride= b_width;
+            BlockNode *bn= &s->block[mb_x + mb_y*b_stride];
+
+            if (bn->type)
+                continue;
+
+            s->avmv_index++;
+
+            avmv->w = block_w;
+            avmv->h = block_h;
+            avmv->dst_x = block_w*mb_x - block_w/2;
+            avmv->dst_y = block_h*mb_y - block_h/2;
+            avmv->motion_scale = 8;
+            avmv->motion_x = bn->mx * s->mv_scale;
+            avmv->motion_y = bn->my * s->mv_scale;
+            avmv->src_x = avmv->dst_x + avmv->motion_x / 8;
+            avmv->src_y = avmv->dst_y + avmv->motion_y / 8;
+            avmv->source= -1 - bn->ref;
+            avmv->flags = 0;
+        }
 }
 
 static av_always_inline void predict_plane(OBMCContext *s, IDWTELEM *buf, int plane_index, int add){

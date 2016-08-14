@@ -1,8 +1,10 @@
 #include "obmcenc.h"
+#include "h263.h"
 
 int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx)
 {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+    int plane_index, i, ret;
     
     #if FF_API_MOTION_EST
     FF_DISABLE_DEPRECATION_WARNINGS
@@ -13,6 +15,8 @@ int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx)
 
     s->mv_scale       = (avctx->flags & AV_CODEC_FLAG_QPEL) ? 2 : 4;
     s->block_max_depth= (avctx->flags & AV_CODEC_FLAG_4MV ) ? 1 : 0;
+    
+    avcodec_get_chroma_sub_sample(avctx->pix_fmt, &s->chroma_h_shift, &s->chroma_v_shift);
 
     for(plane_index=0; plane_index<3; plane_index++){
         s->plane[plane_index].diag_mc= 1;
@@ -25,7 +29,7 @@ int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx)
     
     ff_mpegvideoencdsp_init(&s->mpvencdsp, avctx);
 
-    ff_obmc_alloc_blocks(&s);
+    ff_obmc_alloc_blocks(s);
     
     s->m.avctx   = avctx;
     s->m.bit_rate= avctx->bit_rate;
@@ -53,7 +57,7 @@ int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx)
     if (!s->input_picture)
         return AVERROR(ENOMEM);
 
-    if ((ret = ff_ffv1_get_buffer(s, s->input_picture)) < 0)
+    if ((ret = ff_obmc_get_buffer(s, s->input_picture)) < 0)
         return ret;
 
     if(s->motion_est == FF_ME_ITER){
@@ -65,6 +69,8 @@ int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx)
                 return AVERROR(ENOMEM);
         }
     }
+    
+    return 0;
 }
 
 //near copy & paste from dsputil, FIXME
@@ -278,10 +284,10 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
         put_rac(&pc, &p_state[4 + s_context], 1);
     put_rac(&pc, &p_state[1 + left->type + top->type], 0);
     if(s->ref_frames > 1)
-        put_symbol(&pc, &p_state[128 + 1024 + 32*ref_context], best_ref, 0);
+        s->put_symbol(&pc, &p_state[128 + 1024 + 32*ref_context], best_ref, 0);
     pred_mv(s, &pmx, &pmy, best_ref, left, top, tr);
-    put_symbol(&pc, &p_state[128 + 32*(mx_context + 16*!!best_ref)], mx - pmx, 1);
-    put_symbol(&pc, &p_state[128 + 32*(my_context + 16*!!best_ref)], my - pmy, 1);
+    s->put_symbol(&pc, &p_state[128 + 32*(mx_context + 16*!!best_ref)], mx - pmx, 1);
+    s->put_symbol(&pc, &p_state[128 + 32*(my_context + 16*!!best_ref)], my - pmy, 1);
     p_len= pc.bytestream - pc.bytestream_start;
     score += (s->lambda2*(get_rac_count(&pc)-base_bits))>>FF_LAMBDA_SHIFT;
 
@@ -308,10 +314,10 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
     if(level!=s->block_max_depth)
         put_rac(&ic, &i_state[4 + s_context], 1);
     put_rac(&ic, &i_state[1 + left->type + top->type], 1);
-    put_symbol(&ic, &i_state[32],  l-pl , 1);
+    s->put_symbol(&ic, &i_state[32],  l-pl , 1);
     if (s->nb_planes > 2) {
-        put_symbol(&ic, &i_state[64], cb-pcb, 1);
-        put_symbol(&ic, &i_state[96], cr-pcr, 1);
+        s->put_symbol(&ic, &i_state[64], cb-pcb, 1);
+        s->put_symbol(&ic, &i_state[96], cr-pcr, 1);
     }
     i_len= ic.bytestream - ic.bytestream_start;
     iscore += (s->lambda2*(get_rac_count(&ic)-base_bits))>>FF_LAMBDA_SHIFT;
@@ -403,30 +409,30 @@ static void encode_q_branch2(OBMCContext *s, int level, int x, int y)
     if(b->type & BLOCK_INTRA){
         pred_mv(s, &pmx, &pmy, 0, left, top, tr);
         put_rac(rc_s, &s->block_state[1 + (left->type&1) + (top->type&1)], 1);
-        put_symbol(rc_s, &s->block_state[32], b->color[0]-pl , 1);
+        s->put_symbol(rc_s, &s->block_state[32], b->color[0]-pl , 1);
         if (s->nb_planes > 2) {
-            put_symbol(rc_s, &s->block_state[64], b->color[1]-pcb, 1);
-            put_symbol(rc_s, &s->block_state[96], b->color[2]-pcr, 1);
+            s->put_symbol(rc_s, &s->block_state[64], b->color[1]-pcb, 1);
+            s->put_symbol(rc_s, &s->block_state[96], b->color[2]-pcr, 1);
         }
         set_blocks(s, level, x, y, b->color[0], b->color[1], b->color[2], pmx, pmy, 0, BLOCK_INTRA);
     }else{
         pred_mv(s, &pmx, &pmy, b->ref, left, top, tr);
         put_rac(rc_s, &s->block_state[1 + (left->type&1) + (top->type&1)], 0);
         if(s->ref_frames > 1)
-            put_symbol(rc_s, &s->block_state[128 + 1024 + 32*ref_context], b->ref, 0);
-        put_symbol(rc_s, &s->block_state[128 + 32*mx_context], b->mx - pmx, 1);
-        put_symbol(rc_s, &s->block_state[128 + 32*my_context], b->my - pmy, 1);
+            s->put_symbol(rc_s, &s->block_state[128 + 1024 + 32*ref_context], b->ref, 0);
+        s->put_symbol(rc_s, &s->block_state[128 + 32*mx_context], b->mx - pmx, 1);
+        s->put_symbol(rc_s, &s->block_state[128 + 32*my_context], b->my - pmy, 1);
         set_blocks(s, level, x, y, pl, pcb, pcr, b->mx, b->my, b->ref, 0);
     }
 }
 
 static int get_dc(OBMCContext *s, int mb_x, int mb_y, int plane_index){
     int i, x2, y2;
-    Plane *p= &s->plane[plane_index];
+    PlaneObmc *p= &s->plane[plane_index];
     const int block_size = MB_SIZE >> s->block_max_depth;
     const int block_w    = plane_index ? block_size>>s->chroma_h_shift : block_size;
     const int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
-    const uint8_t *obmc  = plane_index ? ff_ffv1_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_ffv1_obmc_tab[s->block_max_depth];
+    const uint8_t *obmc  = plane_index ? ff_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_obmc_tab[s->block_max_depth];
     const int obmc_stride= plane_index ? (2*block_size)>>s->chroma_h_shift : 2*block_size;
     const int ref_stride= s->current_picture->linesize[plane_index];
     uint8_t *src= s-> input_picture->data[plane_index];
@@ -517,7 +523,7 @@ static inline int get_block_bits(OBMCContext *s, int x, int y, int w){
 }
 
 static int get_block_rd(OBMCContext *s, int mb_x, int mb_y, int plane_index, uint8_t (*obmc_edged)[MB_SIZE * 2]){
-    Plane *p= &s->plane[plane_index];
+    PlaneObmc *p= &s->plane[plane_index];
     const int block_size = MB_SIZE >> s->block_max_depth;
     const int block_w    = plane_index ? block_size>>s->chroma_h_shift : block_size;
     const int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
@@ -545,7 +551,7 @@ static int get_block_rd(OBMCContext *s, int mb_x, int mb_y, int plane_index, uin
 
     av_assert2(s->chroma_h_shift == s->chroma_v_shift); //obmc and square assumtions below chckinhg only block_w
 
-    ff_ffv1_pred_block(s, cur, tmp, ref_stride, sx, sy, block_w*2, block_h*2, &s->block[mb_x + mb_y*b_stride], plane_index, w, h);
+    ff_obmc_pred_block(s, cur, tmp, ref_stride, sx, sy, block_w*2, block_h*2, &s->block[mb_x + mb_y*b_stride], plane_index, w, h);
 
     for(y=y0; y<y1; y++){
         const uint8_t *obmc1= obmc_edged[y];
@@ -619,11 +625,11 @@ static int get_block_rd(OBMCContext *s, int mb_x, int mb_y, int plane_index, uin
 
 static int get_4block_rd(OBMCContext *s, int mb_x, int mb_y, int plane_index){
     int i, y2;
-    Plane *p= &s->plane[plane_index];
+    PlaneObmc *p= &s->plane[plane_index];
     const int block_size = MB_SIZE >> s->block_max_depth;
     const int block_w    = plane_index ? block_size>>s->chroma_h_shift : block_size;
     const int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
-    const uint8_t *obmc  = plane_index ? ff_ffv1_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_ffv1_obmc_tab[s->block_max_depth];
+    const uint8_t *obmc  = plane_index ? ff_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_obmc_tab[s->block_max_depth];
     const int obmc_stride= plane_index ? (2*block_size)>>s->chroma_h_shift : 2*block_size;
     const int ref_stride= s->current_picture->linesize[plane_index];
     uint8_t *dst= s->current_picture->data[plane_index];
@@ -786,13 +792,13 @@ static void iterative_me(OBMCContext *s){
     int color[3];
 
     {
-        RangeCoder r = s->slice_context[0]->c;
+        RangeCoder r = *s->c;
         uint8_t state[sizeof(s->block_state)];
         memcpy(state, s->block_state, sizeof(s->block_state));
         for(mb_y= 0; mb_y<s->b_height; mb_y++)
             for(mb_x= 0; mb_x<s->b_width; mb_x++)
                 encode_q_branch(s, 0, mb_x, mb_y);
-        s->slice_context[0]->c = r;
+        *s->c = r;
         memcpy(s->block_state, state, sizeof(s->block_state));
     }
 
@@ -831,7 +837,7 @@ static void iterative_me(OBMCContext *s){
                 {
                     int x, y;
                     for (y = 0; y < b_w * 2; y++)
-                        memcpy(obmc_edged[y], ff_ffv1_obmc_tab[s->block_max_depth] + y * b_w * 2, b_w * 2);
+                        memcpy(obmc_edged[y], ff_obmc_tab[s->block_max_depth] + y * b_w * 2, b_w * 2);
                     if(mb_x==0)
                         for(y=0; y<b_w*2; y++)
                             memset(obmc_edged[y], obmc_edged[y][0] + obmc_edged[y][b_w-1], b_w);
@@ -1009,7 +1015,7 @@ static void encode_blocks(OBMCContext *s, int search){
     int x, y;
     int w= s->b_width;
     int h= s->b_height;
-    RangeCoder *const c = &s->slice_context[0]->c;
+    RangeCoder *const c = s->c;
 
     if(s->motion_est == FF_ME_ITER && !s->key_frame && search)
         iterative_me(s);
@@ -1028,98 +1034,97 @@ static void encode_blocks(OBMCContext *s, int search){
     }
 }
 
-void obmc_encode_frame(OBMCContext *f, AVCodecContext *avctx, const AVFrame *pict)
+int obmc_pre_encode_frame(OBMCContext *f, AVCodecContext *avctx, const AVFrame *pict)
 {
-    f->m.pict_type = pic->pict_type = f->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
-
-        if (f->current_picture->data[0]
-    /*#if FF_API_EMU_EDGE
+    const int width= f->avctx->width;
+    const int height= f->avctx->height;
+    
+    int ret;
+    if (f->current_picture->data[0]
+    #if FF_API_EMU_EDGE
             && !(f->avctx->flags&CODEC_FLAG_EMU_EDGE)
-    #endif*/
-            ) {
-            int w = f->avctx->width;
-            int h = f->avctx->height;
+    #endif
+        ) {
+        int w = f->avctx->width;
+        int h = f->avctx->height;
 
-            f->mpvencdsp.draw_edges(f->current_picture->data[0],
-                                    f->current_picture->linesize[0], w   , h   ,
-                                    EDGE_WIDTH  , EDGE_WIDTH  , EDGE_TOP | EDGE_BOTTOM);
-            if (f->current_picture->data[2]) {
-                f->mpvencdsp.draw_edges(f->current_picture->data[1],
-                                        f->current_picture->linesize[1], w>>f->chroma_h_shift, h>>f->chroma_v_shift,
-                                        EDGE_WIDTH>>f->chroma_h_shift, EDGE_WIDTH>>f->chroma_v_shift, EDGE_TOP | EDGE_BOTTOM);
-                f->mpvencdsp.draw_edges(f->current_picture->data[2],
-                                        f->current_picture->linesize[2], w>>f->chroma_h_shift, h>>f->chroma_v_shift,
-                                        EDGE_WIDTH>>f->chroma_h_shift, EDGE_WIDTH>>f->chroma_v_shift, EDGE_TOP | EDGE_BOTTOM);
-            }
+        f->mpvencdsp.draw_edges(f->current_picture->data[0],
+                                f->current_picture->linesize[0], w   , h   ,
+                                EDGE_WIDTH  , EDGE_WIDTH  , EDGE_TOP | EDGE_BOTTOM);
+        if (f->current_picture->data[2]) {
+            f->mpvencdsp.draw_edges(f->current_picture->data[1],
+                                    f->current_picture->linesize[1], w>>f->chroma_h_shift, h>>f->chroma_v_shift,
+                                    EDGE_WIDTH>>f->chroma_h_shift, EDGE_WIDTH>>f->chroma_v_shift, EDGE_TOP | EDGE_BOTTOM);
+            f->mpvencdsp.draw_edges(f->current_picture->data[2],
+                                    f->current_picture->linesize[2], w>>f->chroma_h_shift, h>>f->chroma_v_shift,
+                                    EDGE_WIDTH>>f->chroma_h_shift, EDGE_WIDTH>>f->chroma_v_shift, EDGE_TOP | EDGE_BOTTOM);
         }
+    }
 
-        ff_obmc_frame_start(f);
+    ff_obmc_frame_start(f);
         
 #if FF_API_CODED_FRAME
 FF_DISABLE_DEPRECATION_WARNINGS
-        av_frame_unref(avctx->coded_frame);
-        ret = av_frame_ref(avctx->coded_frame, f->current_picture);
-        if (ret < 0)
-            return ret;
+    av_frame_unref(avctx->coded_frame);
+    ret = av_frame_ref(avctx->coded_frame, f->current_picture);
+    if (ret < 0)
+        return ret;
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
 
-        f->m.current_picture_ptr= &f->m.current_picture;
-        f->m.current_picture.f = f->current_picture;
-        f->m.current_picture.f->pts = pict->pts;
-        if(pic->pict_type == AV_PICTURE_TYPE_P){
-            int block_width = (width +15)>>4;
-            int block_height= (height+15)>>4;
-            int stride= f->current_picture->linesize[0];
+    f->m.current_picture_ptr= &f->m.current_picture;
+    f->m.current_picture.f = f->current_picture;
+    f->m.current_picture.f->pts = pict->pts;
+    if(f->m.pict_type == AV_PICTURE_TYPE_P){
+        int block_width = (width +15)>>4;
+        int block_height= (height+15)>>4;
+        int stride= f->current_picture->linesize[0];
 
-            av_assert0(f->current_picture->data[0]);
-            av_assert0(f->last_pictures[0]->data[0]);
+        av_assert0(f->current_picture->data[0]);
+        av_assert0(f->last_pictures[0]->data[0]);
 
-            f->m.avctx= f->avctx;
-            f->m.last_picture.f = f->last_pictures[0];
-            f->m.new_picture.f = f->input_picture;
-            f->m.last_picture_ptr= &f->m.last_picture;
-            f->m.linesize = stride;
-            f->m.uvlinesize= f->current_picture->linesize[1];
-            f->m.width = width;
-            f->m.height= height;
-            f->m.mb_width = block_width;
-            f->m.mb_height= block_height;
-            f->m.mb_stride=   f->m.mb_width+1;
-            f->m.b8_stride= 2*f->m.mb_width+1;
-            f->m.f_code=1;
-            f->m.pict_type = pic->pict_type;
+        f->m.avctx= f->avctx;
+        f->m.last_picture.f = f->last_pictures[0];
+        f->m.new_picture.f = f->input_picture;
+        f->m.last_picture_ptr= &f->m.last_picture;
+        f->m.linesize = stride;
+        f->m.uvlinesize= f->current_picture->linesize[1];
+        f->m.width = width;
+        f->m.height= height;
+        f->m.mb_width = block_width;
+        f->m.mb_height= block_height;
+        f->m.mb_stride=   f->m.mb_width+1;
+        f->m.b8_stride= 2*f->m.mb_width+1;
+        f->m.f_code=1;
+        /* s->m.pict_type = pic->pict_type; // DELETED */
 #if FF_API_MOTION_EST
 FF_DISABLE_DEPRECATION_WARNINGS
-            f->m.me_method= f->avctx->me_method;
+        f->m.me_method= f->avctx->me_method;
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
-            f->m.motion_est= f->motion_est;
-            f->m.me.scene_change_score=0;
-            f->m.me.dia_size = avctx->dia_size;
-            f->m.quarter_sample= (f->avctx->flags & AV_CODEC_FLAG_QPEL)!=0;
-            f->m.out_format= FMT_H263;
-            f->m.unrestricted_mv= 1;
+        f->m.motion_est= f->motion_est;
+        f->m.me.scene_change_score=0;
+        f->m.me.dia_size = avctx->dia_size;
+        f->m.quarter_sample= (f->avctx->flags & AV_CODEC_FLAG_QPEL)!=0;
+        f->m.out_format= FMT_H263;
+        f->m.unrestricted_mv= 1;
 
-            f->m.lambda = f->lambda;
-            f->m.qscale= (f->m.lambda*139 + FF_LAMBDA_SCALE*64) >> (FF_LAMBDA_SHIFT + 7);
-            f->lambda2= f->m.lambda2= (f->m.lambda*f->m.lambda + FF_LAMBDA_SCALE/2) >> FF_LAMBDA_SHIFT;
+        f->m.lambda = f->lambda;
+        f->m.qscale= (f->m.lambda*139 + FF_LAMBDA_SCALE*64) >> (FF_LAMBDA_SHIFT + 7);
+        f->lambda2= f->m.lambda2= (f->m.lambda*f->m.lambda + FF_LAMBDA_SCALE/2) >> FF_LAMBDA_SHIFT;
 
-            f->m.mecc= f->mecc; //move
-            f->m.qdsp= f->qdsp; //move
-            f->m.hdsp = f->hdsp;
-            ff_init_me(&f->m);
-            f->hdsp = f->m.hdsp;
-            f->mecc= f->m.mecc;
-        }
+        f->m.mecc= f->mecc; //move
+        f->m.qdsp= f->qdsp; //move
+        f->m.hdsp = f->hdsp;
+        ff_init_me(&f->m);
+        f->hdsp = f->m.hdsp;
+        f->mecc= f->m.mecc;
+    }
+    
+    return 0;
+}
 
-        f->m.pict_type = pic->pict_type;
-        
-        ff_obmc_common_init_after_header(&f->obmc);
-
-        f->obmc.m.misc_bits = 8*(f->c->bytestream - f->c->bytestream_start);
-        //RangeCoder tmp = f->c;
-        encode_blocks(f, 1);
-        //*f->c = tmp;
-        f->obmc.m.mv_bits = 8*(f->c->bytestream - f->c->bytestream_start) - f->m.misc_bits;
+void obmc_encode_blocks(OBMCContext *s, int search)
+{
+    encode_blocks(s, search);
 }

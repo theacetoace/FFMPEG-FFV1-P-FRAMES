@@ -1,150 +1,7 @@
 #include "obmc.h"
+#include "obmc_data.h"
 
-void ff_obmc_pred_block(OBMCContext *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,
-                     int sx, int sy, int b_w, int b_h, const BlockNode *block,
-                     int plane_index, int w, int h)
-{
-    if(block->type & BLOCK_INTRA){
-        int x, y;
-        const unsigned color  = block->color[plane_index];
-        const unsigned color4 = color*0x01010101;
-        if(b_w==32){
-            for(y=0; y < b_h; y++){
-                *(uint32_t*)&dst[0 + y*stride]= color4;
-                *(uint32_t*)&dst[4 + y*stride]= color4;
-                *(uint32_t*)&dst[8 + y*stride]= color4;
-                *(uint32_t*)&dst[12+ y*stride]= color4;
-                *(uint32_t*)&dst[16+ y*stride]= color4;
-                *(uint32_t*)&dst[20+ y*stride]= color4;
-                *(uint32_t*)&dst[24+ y*stride]= color4;
-                *(uint32_t*)&dst[28+ y*stride]= color4;
-            }
-        }else if(b_w==16){
-            for(y=0; y < b_h; y++){
-                *(uint32_t*)&dst[0 + y*stride]= color4;
-                *(uint32_t*)&dst[4 + y*stride]= color4;
-                *(uint32_t*)&dst[8 + y*stride]= color4;
-                *(uint32_t*)&dst[12+ y*stride]= color4;
-            }
-        }else if(b_w==8){
-            for(y=0; y < b_h; y++){
-                *(uint32_t*)&dst[0 + y*stride]= color4;
-                *(uint32_t*)&dst[4 + y*stride]= color4;
-            }
-        }else if(b_w==4){
-            for(y=0; y < b_h; y++){
-                *(uint32_t*)&dst[0 + y*stride]= color4;
-            }
-        }else{
-            for(y=0; y < b_h; y++){
-                for(x=0; x < b_w; x++){
-                    dst[x + y*stride]= color;
-                }
-            }
-        }
-    }else{
-        uint8_t *src= s->last_pictures[block->ref]->data[plane_index];
-        const int scale= plane_index ?  (2*s->mv_scale)>>s->chroma_h_shift : 2*s->mv_scale;
-        int mx= block->mx*scale;
-        int my= block->my*scale;
-        const int dx= mx&15;
-        const int dy= my&15;
-        const int tab_index= 3 - (b_w>>2) + (b_w>>4);
-        sx += (mx>>4) - (HTAPS_MAX/2-1);
-        sy += (my>>4) - (HTAPS_MAX/2-1);
-        src += sx + sy*stride;
-        if(   (unsigned)sx >= FFMAX(w - b_w - (HTAPS_MAX-2), 0)
-           || (unsigned)sy >= FFMAX(h - b_h - (HTAPS_MAX-2), 0)){
-            s->vdsp.emulated_edge_mc(tmp + MB_SIZE, src,
-                                     stride, stride,
-                                     b_w+HTAPS_MAX-1, b_h+HTAPS_MAX-1,
-                                     sx, sy, w, h);
-            src= tmp + MB_SIZE;
-        }
-
-        av_assert2(s->chroma_h_shift == s->chroma_v_shift); // only one mv_scale
-
-        av_assert2((tab_index>=0 && tab_index<4) || b_w==32);
-        if(    (dx&3) || (dy&3)
-            || !(b_w == b_h || 2*b_w == b_h || b_w == 2*b_h)
-            || (b_w&(b_w-1))
-            || b_w == 1
-            || b_h == 1
-            || !s->plane[plane_index].fast_mc )
-            mc_block(&s->plane[plane_index], dst, src, stride, b_w, b_h, dx, dy);
-        else if(b_w==32){
-            int y;
-            for(y=0; y<b_h; y+=16){
-                s->h264qpel.put_h264_qpel_pixels_tab[0][dy+(dx>>2)](dst + y*stride, src + 3 + (y+3)*stride,stride);
-                s->h264qpel.put_h264_qpel_pixels_tab[0][dy+(dx>>2)](dst + 16 + y*stride, src + 19 + (y+3)*stride,stride);
-            }
-        }else if(b_w==b_h)
-            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst,src + 3 + 3*stride,stride);
-        else if(b_w==2*b_h){
-            s->h264qpel.put_h264_qpel_pixels_tab[tab_index+1][dy+(dx>>2)](dst    ,src + 3       + 3*stride,stride);
-            s->h264qpel.put_h264_qpel_pixels_tab[tab_index+1][dy+(dx>>2)](dst+b_h,src + 3 + b_h + 3*stride,stride);
-        }else{
-            av_assert2(2*b_w==b_h);
-            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst           ,src + 3 + 3*stride           ,stride);
-            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst+b_w*stride,src + 3 + 3*stride+b_w*stride,stride);
-        }
-    }
-}
-
-int ff_obmc_get_buffer(OBMCContext *s, AVFrame *frame)
-{
-    int ret, i;
-    int edges_needed = av_codec_is_encoder(s->avctx->codec);
-
-    frame->width  = s->avctx->width ;
-    frame->height = s->avctx->height;
-    if (edges_needed) {
-        frame->width  += 2 * EDGE_WIDTH;
-        frame->height += 2 * EDGE_WIDTH;
-    }
-    if ((ret = ff_get_buffer(s->avctx, frame, AV_GET_BUFFER_FLAG_REF)) < 0)
-        return ret;
-    if (edges_needed) {
-        for (i = 0; frame->data[i]; i++) {
-            int offset = (EDGE_WIDTH >> (i ? s->chroma_v_shift : 0)) *
-                            frame->linesize[i] +
-                            (EDGE_WIDTH >> (i ? s->chroma_h_shift : 0));
-            frame->data[i] += offset;
-        }
-        frame->width  = s->avctx->width;
-        frame->height = s->avctx->height;
-    }
-
-    return 0;
-}
-
-void ff_obmc_release_buffer(OBMCContext *s)
-{
-    int i;
-
-    if(s->last_pictures[s->max_ref_frames-1]->data[0]){
-        av_frame_unref(s->last_pictures[s->max_ref_frames-1]);
-        for(i=0; i<9; i++)
-            if(s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3]) {
-                av_free(s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3] - EDGE_WIDTH*(1+s->current_picture->linesize[i%3]));
-                s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3] = NULL;
-            }
-    }
-}
-
-static av_cold void init_qexp(void)
-{
-    int i;
-    double v=128;
-
-    for(i=0; i<QROOT; i++)
-    {
-        ff_qexp[i]= lrintf(v);
-        v *= pow(2, 1.0 / QROOT);
-    }
-}
-
-static void mc_block(Plane *p, uint8_t *dst, const uint8_t *src, int stride, int b_w, int b_h, int dx, int dy){
+static void mc_block(PlaneObmc *p, uint8_t *dst, const uint8_t *src, int stride, int b_w, int b_h, int dx, int dy){
     static const uint8_t weight[64]={
     8,7,6,5,4,3,2,1,
     7,7,0,0,0,0,0,1,
@@ -352,6 +209,150 @@ mca( 8, 0,8)
 mca( 0, 8,8)
 mca( 8, 8,8)
 
+void ff_obmc_pred_block(OBMCContext *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,
+                     int sx, int sy, int b_w, int b_h, const BlockNode *block,
+                     int plane_index, int w, int h)
+{
+    if(block->type & BLOCK_INTRA){
+        int x, y;
+        const unsigned color  = block->color[plane_index];
+        const unsigned color4 = color*0x01010101;
+        if(b_w==32){
+            for(y=0; y < b_h; y++){
+                *(uint32_t*)&dst[0 + y*stride]= color4;
+                *(uint32_t*)&dst[4 + y*stride]= color4;
+                *(uint32_t*)&dst[8 + y*stride]= color4;
+                *(uint32_t*)&dst[12+ y*stride]= color4;
+                *(uint32_t*)&dst[16+ y*stride]= color4;
+                *(uint32_t*)&dst[20+ y*stride]= color4;
+                *(uint32_t*)&dst[24+ y*stride]= color4;
+                *(uint32_t*)&dst[28+ y*stride]= color4;
+            }
+        }else if(b_w==16){
+            for(y=0; y < b_h; y++){
+                *(uint32_t*)&dst[0 + y*stride]= color4;
+                *(uint32_t*)&dst[4 + y*stride]= color4;
+                *(uint32_t*)&dst[8 + y*stride]= color4;
+                *(uint32_t*)&dst[12+ y*stride]= color4;
+            }
+        }else if(b_w==8){
+            for(y=0; y < b_h; y++){
+                *(uint32_t*)&dst[0 + y*stride]= color4;
+                *(uint32_t*)&dst[4 + y*stride]= color4;
+            }
+        }else if(b_w==4){
+            for(y=0; y < b_h; y++){
+                *(uint32_t*)&dst[0 + y*stride]= color4;
+            }
+        }else{
+            for(y=0; y < b_h; y++){
+                for(x=0; x < b_w; x++){
+                    dst[x + y*stride]= color;
+                }
+            }
+        }
+    }else{
+        uint8_t *src= s->last_pictures[block->ref]->data[plane_index];
+        const int scale= plane_index ?  (2*s->mv_scale)>>s->chroma_h_shift : 2*s->mv_scale;
+        int mx= block->mx*scale;
+        int my= block->my*scale;
+        const int dx= mx&15;
+        const int dy= my&15;
+        const int tab_index= 3 - (b_w>>2) + (b_w>>4);
+        sx += (mx>>4) - (HTAPS_MAX/2-1);
+        sy += (my>>4) - (HTAPS_MAX/2-1);
+        src += sx + sy*stride;
+        if(   (unsigned)sx >= FFMAX(w - b_w - (HTAPS_MAX-2), 0)
+           || (unsigned)sy >= FFMAX(h - b_h - (HTAPS_MAX-2), 0)){
+            s->vdsp.emulated_edge_mc(tmp + MB_SIZE, src,
+                                     stride, stride,
+                                     b_w+HTAPS_MAX-1, b_h+HTAPS_MAX-1,
+                                     sx, sy, w, h);
+            src= tmp + MB_SIZE;
+        }
+
+        av_assert2(s->chroma_h_shift == s->chroma_v_shift); // only one mv_scale
+
+        av_assert2((tab_index>=0 && tab_index<4) || b_w==32);
+        if(    (dx&3) || (dy&3)
+            || !(b_w == b_h || 2*b_w == b_h || b_w == 2*b_h)
+            || (b_w&(b_w-1))
+            || b_w == 1
+            || b_h == 1
+            || !s->plane[plane_index].fast_mc )
+            mc_block(&s->plane[plane_index], dst, src, stride, b_w, b_h, dx, dy);
+        else if(b_w==32){
+            int y;
+            for(y=0; y<b_h; y+=16){
+                s->h264qpel.put_h264_qpel_pixels_tab[0][dy+(dx>>2)](dst + y*stride, src + 3 + (y+3)*stride,stride);
+                s->h264qpel.put_h264_qpel_pixels_tab[0][dy+(dx>>2)](dst + 16 + y*stride, src + 19 + (y+3)*stride,stride);
+            }
+        }else if(b_w==b_h)
+            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst,src + 3 + 3*stride,stride);
+        else if(b_w==2*b_h){
+            s->h264qpel.put_h264_qpel_pixels_tab[tab_index+1][dy+(dx>>2)](dst    ,src + 3       + 3*stride,stride);
+            s->h264qpel.put_h264_qpel_pixels_tab[tab_index+1][dy+(dx>>2)](dst+b_h,src + 3 + b_h + 3*stride,stride);
+        }else{
+            av_assert2(2*b_w==b_h);
+            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst           ,src + 3 + 3*stride           ,stride);
+            s->h264qpel.put_h264_qpel_pixels_tab[tab_index  ][dy+(dx>>2)](dst+b_w*stride,src + 3 + 3*stride+b_w*stride,stride);
+        }
+    }
+}
+
+int ff_obmc_get_buffer(OBMCContext *s, AVFrame *frame)
+{
+    int ret, i;
+    int edges_needed = av_codec_is_encoder(s->avctx->codec);
+
+    frame->width  = s->avctx->width ;
+    frame->height = s->avctx->height;
+    if (edges_needed) {
+        frame->width  += 2 * EDGE_WIDTH;
+        frame->height += 2 * EDGE_WIDTH;
+    }
+    if ((ret = ff_get_buffer(s->avctx, frame, AV_GET_BUFFER_FLAG_REF)) < 0)
+        return ret;
+    if (edges_needed) {
+        for (i = 0; frame->data[i]; i++) {
+            int offset = (EDGE_WIDTH >> (i ? s->chroma_v_shift : 0)) *
+                            frame->linesize[i] +
+                            (EDGE_WIDTH >> (i ? s->chroma_h_shift : 0));
+            frame->data[i] += offset;
+        }
+        frame->width  = s->avctx->width;
+        frame->height = s->avctx->height;
+    }
+
+    return 0;
+}
+
+void ff_obmc_release_buffer(OBMCContext *s)
+{
+    int i;
+
+    if(s->last_pictures[s->max_ref_frames-1]->data[0]){
+        av_frame_unref(s->last_pictures[s->max_ref_frames-1]);
+        for(i=0; i<9; i++)
+            if(s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3]) {
+                av_free(s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3] - EDGE_WIDTH*(1+s->current_picture->linesize[i%3]));
+                s->halfpel_plane[s->max_ref_frames-1][1+i/3][i%3] = NULL;
+            }
+    }
+}
+
+static av_cold void init_qexp(void)
+{
+    int i;
+    double v=128;
+
+    for(i=0; i<QROOT; i++)
+    {
+        ff_qexp[i]= lrintf(v);
+        v *= pow(2, 1.0 / QROOT);
+    }
+}
+
 static int halfpel_interpol(OBMCContext *s, uint8_t *halfpel[4][4], AVFrame *frame)
 {
     int p,x,y;
@@ -423,8 +424,7 @@ int ff_obmc_common_init_after_header(OBMCContext *s)
     int ret, emu_buf_size;
 
     if(!s->scratchbuf) {
-        if ((ret = ff_get_buffer(s->avctx, s->mconly_picture,
-                                 AV_GET_BUFFER_FLAG_REF)) < 0)
+        if ((ret = ff_get_buffer(s->avctx, s->mconly_picture, AV_GET_BUFFER_FLAG_REF)) < 0)
             return ret;
         FF_ALLOCZ_ARRAY_OR_GOTO(s->avctx, s->scratchbuf, FFMAX(s->mconly_picture->linesize[0], 2*s->avctx->width+256), 7*MB_SIZE, fail);
         emu_buf_size = FFMAX(s->mconly_picture->linesize[0], 2*s->avctx->width+256) * (2 * MB_SIZE + HTAPS_MAX - 1);
@@ -457,6 +457,16 @@ int ff_obmc_frame_start(OBMCContext *f)
 {
     AVFrame *tmp;
     int i, ret;
+    
+    int USE_HALFPEL_PLANE = 0;
+    
+    switch(f->avctx->codec_id) {
+    case AV_CODEC_ID_FFV1:
+        USE_HALFPEL_PLANE = 1;
+        break;
+    default:
+        break;
+    }
 
     ff_obmc_release_buffer(f);
 
@@ -517,6 +527,11 @@ void ff_obmc_reset_contexts(OBMCContext *s)
 av_cold int ff_obmc_common_init(OBMCContext *s, AVCodecContext *avctx)
 {
     s->avctx = avctx;
+    
+    int width, height, i, j;
+
+    width = avctx->width;
+    height = avctx->height;
     
     ff_me_cmp_init(&s->mecc, avctx);
     ff_hpeldsp_init(&s->hdsp, avctx->flags);
@@ -584,8 +599,10 @@ fail:
     return AVERROR(ENOMEM);
 }
 
-av_cold int ff_obmc_close(AVCodecContext *avctx)
+av_cold int ff_obmc_close(OBMCContext *s)
 {
+    int i;
+    
     av_freep(&s->spatial_idwt_buffer);
 
     s->m.me.temp= NULL;
@@ -609,4 +626,6 @@ av_cold int ff_obmc_close(AVCodecContext *avctx)
 
     av_frame_free(&s->mconly_picture);
     av_frame_free(&s->current_picture);
+    
+    return 0;
 }

@@ -2,9 +2,12 @@
 
 int obmc_decode_init(OBMCContext *f) {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->avctx->pix_fmt);
+    int i;
     f->nb_planes = 0;
     for (i = 0; i < desc->nb_components; i++)
         f->nb_planes = FFMAX(f->nb_planes, desc->comp[i].plane + 1);
+        
+    avcodec_get_chroma_sub_sample(f->avctx->pix_fmt, &f->chroma_h_shift, &f->chroma_v_shift);
         
     return 0;
 }
@@ -41,21 +44,21 @@ static int decode_q_branch(OBMCContext *s, int level, int x, int y){
 
         if(type){
             pred_mv(s, &mx, &my, 0, left, top, tr);
-            l += get_symbol(c, &s->block_state[32], 1);
+            l += s->get_symbol(c, &s->block_state[32], 1);
             if (s->nb_planes > 2) {
-                cb+= get_symbol(c, &s->block_state[64], 1);
-                cr+= get_symbol(c, &s->block_state[96], 1);
+                cb+= s->get_symbol(c, &s->block_state[64], 1);
+                cr+= s->get_symbol(c, &s->block_state[96], 1);
             }
         }else{
             if(s->ref_frames > 1)
-                ref= get_symbol(c, &s->block_state[128 + 1024 + 32*ref_context], 0);
+                ref= s->get_symbol(c, &s->block_state[128 + 1024 + 32*ref_context], 0);
             if (ref >= s->ref_frames) {
                 av_log(s->avctx, AV_LOG_ERROR, "Invalid ref\n");
                 return AVERROR_INVALIDDATA;
             }
             pred_mv(s, &mx, &my, ref, left, top, tr);
-            mx+= get_symbol(c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
-            my+= get_symbol(c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
+            mx+= s->get_symbol(c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
+            my+= s->get_symbol(c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
         }
         set_blocks(s, level, x, y, l, cb, cr, mx, my, ref, type);
     }else{
@@ -85,8 +88,9 @@ static int decode_blocks(OBMCContext *s){
 }
 
 int obmc_decode_frame(OBMCContext *f) {
+    int plane_index, ret;
     for(plane_index=0; plane_index < f->nb_planes; plane_index++){
-       Plane *pc= &f->plane[plane_index];
+       PlaneObmc *pc= &f->plane[plane_index];
        pc->fast_mc= pc->diag_mc && pc->htaps==6 && pc->hcoeff[0]==40
                                              && pc->hcoeff[1]==-10
                                              && pc->hcoeff[2]==2;
@@ -98,6 +102,12 @@ int obmc_decode_frame(OBMCContext *f) {
         return ret;
 
     f->current_picture->pict_type = f->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
+    
+    av_assert0(!f->avmv);
+    if (f->avctx->flags2 & AV_CODEC_FLAG2_EXPORT_MVS) {
+        f->avmv = av_malloc_array(f->b_width * f->b_height, sizeof(AVMotionVector) << (f->block_max_depth*2));
+    }
+    f->avmv_index = 0;
 
     if ((ret = decode_blocks(f)) < 0)
         return ret;

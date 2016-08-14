@@ -80,11 +80,6 @@ static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
         memset(f->c_image_line_buf, 0, 2 * width * sizeof(*f->c_image_line_buf));
 
         for (y = 0; y < h1; y++) {
-            /*memcpy(
-                f->p_image_line_buf + width,
-                f->c_image_line_buf + width,
-                width * sizeof(*f->p_image_line_buf)
-            );*/
             memset(f->p_image_line_buf, 0, width * sizeof(*f->p_image_line_buf));
             memset(f->c_image_line_buf, 0, width * sizeof(*f->c_image_line_buf));
             av_read_image_line(f->c_image_line_buf,
@@ -98,13 +93,6 @@ static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
                               desc,
                               0, y, i, w1, 0);
             for (x = 0; x < w1; ++x) {
-                /*uint16_t mid = mid_pred(
-                    x ? f->c_image_line_buf[width + x - 1] : 0,
-                    x ? f->p_image_line_buf[width + x - 1] : 0,
-                    f->p_image_line_buf[width + x]
-                );
-                f->c_image_line_buf[width + x] = (f->c_image_line_buf[x] + mid - (max_val >> 2)) & (max_val - 1);
-                f->c_image_line_buf[x] = f->c_image_line_buf[width + x] + f->p_image_line_buf[x];*/
                 f->c_image_line_buf[x] = (f->c_image_line_buf[x] + f->p_image_line_buf[x] - (max_val >> 2)) & (max_val - 1);
             }
             av_write_image_line(f->c_image_line_buf,
@@ -116,7 +104,6 @@ static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
     }
 
     av_frame_copy(curr, residual);
-    //av_image_copy(curr->data, curr->linesize, residual->data, residual->linesize, curr->format, f->width, f->height);
 
     return 0;
 }
@@ -880,6 +867,8 @@ static int read_header(FFV1Context *f)
     }
     
     obmc_decode_init(&f->obmc);
+    f->obmc.c = &f->slice_context[0]->c;
+    f->obmc.get_symbol = get_symbol;
 
     ff_dlog(f->avctx, "%d %d %d\n",
             f->chroma_h_shift, f->chroma_v_shift, f->avctx->pix_fmt);
@@ -981,7 +970,7 @@ static int decode_p_header(FFV1Context *f)
     if (!f->key_frame) {
         for(plane_index=0; plane_index<FFMIN(f->obmc.nb_planes, 2); plane_index++){
             int htaps, i, sum=0;
-            Plane *p= &f->obmc.plane[plane_index];
+            PlaneObmc *p= &f->obmc.plane[plane_index];
             p->diag_mc = get_rac(c, state);
             htaps = get_symbol(c, state, 0)*2 + 2;
             if((unsigned)htaps > HTAPS_MAX || htaps==0)
@@ -1059,8 +1048,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
     f->obmc.current_picture->pict_type = AV_PICTURE_TYPE_I;
     if (get_rac(c, &keystate)) {
         p->key_frame    = 1;
-        f->key_frame    = 1;
-        f->obmc.key_frame = 1;
+        f->obmc.key_frame = f->key_frame    = 1;
         f->key_frame_ok = 0;
         if ((ret = read_header(f)) < 0)
             return ret;
@@ -1073,8 +1061,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
             return AVERROR_INVALIDDATA;
         }
         p->key_frame = 0;
-        f->key_frame = 0;
-        f->obmc.key_frame = 0;
+        f->obmc.key_frame = f->key_frame = 0;
     }
 
     if (f->p_frame) {
@@ -1095,7 +1082,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
                f->version, p->key_frame, f->ac, f->ec, f->slice_count, f->avctx->bits_per_raw_sample);
 
     if (f->p_frame) {
-        obmc_decode_frame(&f->obmc, avctx);
+        obmc_decode_frame(&f->obmc);
     }
 
     ff_thread_finish_setup(avctx);
@@ -1181,7 +1168,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
         av_frame_copy(f->obmc.last_pictures[1], f->last_picture.f);
         
         for(plane_index=0; plane_index < f->obmc.nb_planes; plane_index++){
-            Plane *pc= &f->obmc.plane[plane_index];
+            PlaneObmc *pc= &f->obmc.plane[plane_index];
             int w= pc->width;
             int h= pc->height;
 
@@ -1269,6 +1256,12 @@ static int init_thread_copy(AVCodecContext *avctx)
     f->obmc.b_height= h;
 
     f->obmc.block = av_mallocz_array(w * h,  sizeof(BlockNode) << 2); // FIXME Maybe large
+    
+    f->obmc.c = &f->slice_context[0]->c;
+    f->obmc.avctx = avctx;
+    
+    f->obmc.chroma_h_shift = f->chroma_h_shift;
+    f->obmc.chroma_v_shift = f->chroma_v_shift;
 
     f->p_image_line_buf = av_mallocz_array(sizeof(*f->p_image_line_buf), 2 * f->width);
     f->c_image_line_buf = av_mallocz_array(sizeof(*f->c_image_line_buf), 2 * f->width);
@@ -1358,6 +1351,9 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
         fdst->obmc.scratchbuf = scratchbuf;
         fdst->obmc.emu_edge_buffer = emu_edge_buffer;
         fdst->obmc.spatial_idwt_buffer = spatial_idwt_buffer;
+        
+        fdst->obmc.c = &fdst->slice_context[0]->c;
+        fdst->obmc.avctx = dst;
 
         for (i = 0; i<fdst->num_h_slices * fdst->num_v_slices; i++) {
             FFV1Context *fssrc = fsrc->slice_context[i];
@@ -1377,7 +1373,7 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
     }
 
     for (i = 0; i < MAX_REF_FRAMES; i++)
-        av_frame_ref(fdst->obmc.last_pictures[i], fsrc->obmc.last_pictures[i]); // FIXME update last_pictures before prediction step        
+        av_frame_ref(fdst->obmc.last_pictures[i], fsrc->obmc.last_pictures[i]);
         
     av_frame_ref(fdst->obmc.current_picture, fsrc->obmc.current_picture);
     

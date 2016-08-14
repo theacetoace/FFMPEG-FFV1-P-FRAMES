@@ -52,7 +52,6 @@ av_cold int ff_ffv1_common_init(AVCodecContext *avctx)
     s->flags = avctx->flags;
 
     int width, height;
-    int i, j;
 
     width = avctx->width;
     height = avctx->height;
@@ -75,6 +74,8 @@ av_cold int ff_ffv1_common_init(AVCodecContext *avctx)
     // defaults
     s->num_h_slices = 1;
     s->num_v_slices = 1;
+    
+    ff_obmc_common_init(&s->obmc, avctx);
 
     return 0;
 fail:
@@ -264,6 +265,8 @@ av_cold int ff_ffv1_close(AVCodecContext *avctx)
 
     for (i = 0; i < s->max_slice_count; i++)
         av_freep(&s->slice_context[i]);
+        
+    ff_obmc_close(&s->obmc);
 
     return 0;
 }

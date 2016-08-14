@@ -6,6 +6,7 @@
 #define FF_ME_ITER 50
 
 int obmc_encode_init(OBMCContext *s, AVCodecContext *avctx);
-void obmc_encode_frame(OBMCContext *f, AVCodecContext *avctx, const AVFrame *pict);
+int obmc_pre_encode_frame(OBMCContext *f, AVCodecContext *avctx, const AVFrame *pict);
+void obmc_encode_blocks(OBMCContext *s, int search);
 
 #endif /* AVCODEC_OBMCENC_H */
