@@ -79,7 +79,7 @@ void ff_snow_reset_contexts(SnowContext *s){ //FIXME better initial contexts
         }
     }
     memset(s->header_state, MID_STATE, sizeof(s->header_state));
-    ff_obmc_reset_contexts(&s->obmc);
+    memset(s->block_state, MID_STATE, sizeof(s->block_state));
 }
 
 av_cold int ff_snow_common_init(AVCodecContext *avctx){

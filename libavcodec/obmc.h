@@ -33,7 +33,6 @@
 #include "qpeldsp.h"
 #include "snow_dwt.h"
 
-#define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(OBMCContext, m))
 #include "mpegvideo.h"
 #include "h264qpel.h"
 
@@ -89,14 +88,41 @@ typedef struct PlaneObmc{
     int last_diag_mc;
 } PlaneObmc;
 
+typedef struct ObmcCoderContext {
+    void *priv_data;
+    AVCodecContext *avctx;
+    
+    int (*get_bits)         (struct ObmcCoderContext *);
+    int (*available_bytes)  (struct ObmcCoderContext *);
+    
+    // UTILS
+    void (*init_frame_coder)  (AVCodecContext *, struct ObmcCoderContext *);
+    void (*copy_coder)        (struct ObmcCoderContext *);
+    void (*reset_coder)       (struct ObmcCoderContext *);
+    void (*free)              (struct ObmcCoderContext *);
+    
+    // DECODER 
+    int  (*get_level_break) (struct ObmcCoderContext *, int);
+    int  (*get_block_type)  (struct ObmcCoderContext *, int);
+    void (*get_block_color) (struct ObmcCoderContext *, int, int, int, int *, int *, int *);
+    int  (*get_best_ref)    (struct ObmcCoderContext *, int);
+    void (*get_block_mv)    (struct ObmcCoderContext *, int, int, int *, int *);
+    
+    // ENCODER
+    void (*put_level_break) (struct ObmcCoderContext *, int, int);
+    void (*put_block_type)  (struct ObmcCoderContext *, int, int);
+    void (*put_best_ref)    (struct ObmcCoderContext *, int, int);
+    void (*put_block_mv)    (struct ObmcCoderContext *, int, int, int, int);
+    void (*put_block_color) (struct ObmcCoderContext *, int, int, int, int, int, int);
+    
+} ObmcCoderContext;
+
 typedef struct OBMCContext {
     AVCodecContext *avctx;
-    RangeCoder *c;
     int key_frame;
     int chroma_h_shift, chroma_v_shift;
     
-    int (*get_symbol)(RangeCoder *, uint8_t *, int );
-    void (*put_symbol)(RangeCoder *, uint8_t *, int, int);
+    ObmcCoderContext obmc_coder;
     
     /* ME/MC part */
     MECmpContext mecc;
@@ -128,7 +154,6 @@ typedef struct OBMCContext {
     int max_ref_frames;
     int ref_frames;
 
-    uint8_t block_state[128 + 32*128];
     BlockNode *block;
     int b_width;
     int b_height;
@@ -162,7 +187,6 @@ void ff_obmc_release_buffer(OBMCContext *s);
 int ff_obmc_common_init_after_header(OBMCContext *s);
 int ff_obmc_frame_start(OBMCContext *f);
 int ff_obmc_alloc_blocks(OBMCContext *s);
-void ff_obmc_reset_contexts(OBMCContext *s);
 int ff_obmc_common_init(OBMCContext *s, AVCodecContext *avctx);
 int ff_obmc_close(OBMCContext *s);
 void ff_obmc_pred_block(OBMCContext *s, uint8_t *dst, uint8_t *tmp, ptrdiff_t stride,

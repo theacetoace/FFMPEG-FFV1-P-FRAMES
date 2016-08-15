@@ -540,14 +540,12 @@ int ff_obmc_alloc_blocks(OBMCContext *s)
     return 0;
 }
 
-void ff_obmc_reset_contexts(OBMCContext *s)
-{
-    memset(s->block_state, MID_STATE, sizeof(s->block_state));
-}
-
 av_cold int ff_obmc_common_init(OBMCContext *s, AVCodecContext *avctx)
 {
     s->avctx = avctx;
+    
+    s->obmc_coder.priv_data = NULL;
+    s->obmc_coder.avctx = NULL;
     
     int width, height, i, j;
 

@@ -338,6 +338,165 @@ static inline void put_vlc_symbol(PutBitContext *pb, VlcState *const state,
     update_vlc_state(state, v);
 }
 
+typedef struct RangeEncoderContext {
+    RangeCoder c;
+    uint8_t buffer[1024];
+    uint8_t state[128 + 32*128];
+    uint8_t *pbbak;
+    uint8_t *pbbak_start;
+    int base_bits;
+} RangeEncoderContext;
+
+static void ff_ffv1_init_encode_callbacks(ObmcCoderContext *, AVCodecContext *);
+
+static void init_frame_encoder(AVCodecContext *avctx, ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = av_mallocz(sizeof(RangeEncoderContext));
+    c->priv_data = coder;
+    
+    coder->pbbak = rc->bytestream;
+    coder->pbbak_start = rc->bytestream_start;
+    coder->base_bits = get_rac_count(rc) - 8*(rc->bytestream - rc->bytestream_start);
+    coder->c = *rc;
+    coder->c.bytestream_start = coder->c.bytestream = coder->buffer; //FIXME end/start? and at the other stoo
+    memcpy(coder->state, f->block_state, sizeof(f->block_state));
+    
+    ff_ffv1_init_encode_callbacks(c, avctx);
+}
+
+static void free_coder (ObmcCoderContext *c)
+{
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        av_freep(&coder);
+    }
+}
+
+static void copy_coder        (struct ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    
+    int len = coder->c.bytestream - coder->c.bytestream_start;
+    
+    memcpy(coder->pbbak, coder->buffer, len);
+    *rc = coder->c;
+    rc->bytestream_start= coder->pbbak_start;
+    rc->bytestream= coder->pbbak + len;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+static void reset_coder      (struct ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    
+    *rc = coder->c;
+    rc->bytestream_start= coder->pbbak_start;
+    rc->bytestream= coder->pbbak;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+#define SET_IF_CODER(c)                                                         \
+    do {                                                                        \
+        if (c->priv_data) {                                                     \
+            RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;   \
+            rc = &coder->c; state = coder->state;                               \
+        }                                                                       \
+    } while (0)
+
+static void put_level_break (struct ObmcCoderContext *c, int ctx, int v)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_rac(rc, &state[ctx], v);
+}
+
+static void put_block_type  (struct ObmcCoderContext *c, int ctx, int type) 
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_rac(rc, &state[ctx], type);
+}
+
+static void put_best_ref    (struct ObmcCoderContext *c, int ctx, int best_ref)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx], best_ref, 0);
+}
+
+static void put_block_mv    (struct ObmcCoderContext *c, int ctx_mx, int ctx_my, int mx, int my)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx_mx], mx, 1);
+    put_symbol(rc, &state[ctx_my], my, 1);
+}
+
+static void put_block_color (struct ObmcCoderContext *c, int ctx_l, int ctx_cb, int ctx_cr, int l, int cb, int cr)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx_l],  l , 1);
+    if (f->obmc.nb_planes > 2) {
+        put_symbol(rc, &state[ctx_cb], cb, 1);
+        put_symbol(rc, &state[ctx_cr], cr, 1);
+    }
+}
+
+static int get_coder_bits(ObmcCoderContext *c)
+{
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    return get_rac_count(&coder->c) - coder->base_bits;
+}
+
+static int get_coder_available_bytes(ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        rc = &coder->c;
+    }
+    return rc->bytestream_end - rc->bytestream;
+}
+
+#undef SET_IF_CODER
+
+static void ff_ffv1_init_encode_callbacks(ObmcCoderContext *c, AVCodecContext *avctx)
+{
+    c->avctx            = avctx;
+    c->put_level_break  = put_level_break;
+    c->put_block_type   = put_block_type;
+    c->put_block_color  = put_block_color;
+    c->put_best_ref     = put_best_ref;
+    c->put_block_mv     = put_block_mv;
+    
+    c->init_frame_coder = init_frame_encoder;
+    c->reset_coder      = reset_coder;
+    c->copy_coder       = copy_coder;
+    c->free             = free_coder;
+    
+    c->get_bits         = get_coder_bits;
+    c->available_bytes  = get_coder_available_bytes;
+    
+}
+
 static av_always_inline int encode_line(FFV1Context *s, int w,
                                         int16_t *sample[3],
                                         int plane_index, int bits)
@@ -621,7 +780,8 @@ static void write_p_header(FFV1Context *f)
     memset(state, 128, sizeof(state));
 
     if (f->key_frame) {
-        ff_obmc_reset_contexts(&f->obmc);
+        //ff_obmc_reset_contexts(&f->obmc);
+        memset(f->block_state, MID_STATE, sizeof(f->block_state));
         put_symbol(c, state, f->obmc.max_ref_frames-1, 0);
     }
     if (!f->key_frame) { //FIXME update_mc
@@ -1132,8 +1292,7 @@ slices_ok:
     }
     
     obmc_encode_init(&s->obmc, avctx);
-    s->obmc.c = &s->slice_context[0]->c;
-    s->obmc.put_symbol = put_symbol;
+    ff_ffv1_init_encode_callbacks(&s->obmc.obmc_coder, avctx);
 
     return 0;
 }

@@ -161,15 +161,9 @@ static inline int get_penalty_factor(int lambda, int lambda2, int type){
 
 static int encode_q_branch(OBMCContext *s, int level, int x, int y)
 {
-    RangeCoder *rc_s = s->c;
-    uint8_t p_buffer[1024];
-    uint8_t i_buffer[1024];
-    uint8_t p_state[sizeof(s->block_state)];
-    uint8_t i_state[sizeof(s->block_state)];
-    RangeCoder pc, ic;
-    uint8_t *pbbak= rc_s->bytestream;
-    uint8_t *pbbak_start= rc_s->bytestream_start;
-    int score, score2, iscore, i_len, p_len, block_s, sum, base_bits;
+    ObmcCoderContext *const rc = &s->obmc_coder;
+    ObmcCoderContext pc, ic;
+    int score, score2, iscore, block_s, sum;;
     const int w= s->b_width  << s->block_max_depth;
     const int h= s->b_height << s->block_max_depth;
     const int rem_depth= s->block_max_depth - level;
@@ -205,7 +199,7 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
     int s_context= 2*left->level + 2*top->level + tl->level + tr->level;
     int ref, best_ref, ref_score, ref_mx, ref_my;
 
-    av_assert0(sizeof(s->block_state) >= 256);
+    //av_assert0(sizeof(s->block_state) >= 256);
     if(s->key_frame){
         set_blocks(s, level, x, y, pl, pcb, pcr, 0, 0, 0, BLOCK_INTRA);
         return 0;
@@ -295,22 +289,19 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
     //FIXME if mb_cmp != SSE then intra cannot be compared currently and mb_penalty vs. lambda2
 
     // subpel search
-    base_bits= get_rac_count(rc_s) - 8*(rc_s->bytestream - rc_s->bytestream_start);
-    pc= *rc_s;
-    pc.bytestream_start=
-    pc.bytestream= p_buffer; //FIXME end/start? and at the other stoo
-    memcpy(p_state, s->block_state, sizeof(s->block_state));
+    rc->init_frame_coder(s->avctx, &pc);
 
     if(level!=s->block_max_depth)
-        put_rac(&pc, &p_state[4 + s_context], 1);
-    put_rac(&pc, &p_state[1 + left->type + top->type], 0);
+        pc.put_level_break(&pc, 4 + s_context, 1);
+    pc.put_block_type(&pc, 1 + left->type + top->type, 0);
     if(s->ref_frames > 1)
-        s->put_symbol(&pc, &p_state[128 + 1024 + 32*ref_context], best_ref, 0);
+        pc.put_best_ref(&pc, 128 + 1024 + 32*ref_context, best_ref);
     pred_mv(s, &pmx, &pmy, best_ref, left, top, tr);
-    s->put_symbol(&pc, &p_state[128 + 32*(mx_context + 16*!!best_ref)], mx - pmx, 1);
-    s->put_symbol(&pc, &p_state[128 + 32*(my_context + 16*!!best_ref)], my - pmy, 1);
-    p_len= pc.bytestream - pc.bytestream_start;
-    score += (s->lambda2*(get_rac_count(&pc)-base_bits))>>FF_LAMBDA_SHIFT;
+    pc.put_block_mv(&pc, 
+        128 + 32*(mx_context + 16*!!best_ref), 128 + 32*(my_context + 16*!!best_ref),
+        mx - pmx, my - pmy
+    );
+    score += (s->lambda2*pc.get_bits(&pc))>>FF_LAMBDA_SHIFT;
 
     block_s= block_w*block_w;
     sum = pix_sum(current_data[0], stride, block_w, block_w);
@@ -328,20 +319,13 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
     }else
         cb = cr = 0;
 
-    ic= *rc_s;
-    ic.bytestream_start=
-    ic.bytestream= i_buffer; //FIXME end/start? and at the other stoo
-    memcpy(i_state, s->block_state, sizeof(s->block_state));
+    rc->init_frame_coder(s->avctx, &ic);
+    
     if(level!=s->block_max_depth)
-        put_rac(&ic, &i_state[4 + s_context], 1);
-    put_rac(&ic, &i_state[1 + left->type + top->type], 1);
-    s->put_symbol(&ic, &i_state[32],  l-pl , 1);
-    if (s->nb_planes > 2) {
-        s->put_symbol(&ic, &i_state[64], cb-pcb, 1);
-        s->put_symbol(&ic, &i_state[96], cr-pcr, 1);
-    }
-    i_len= ic.bytestream - ic.bytestream_start;
-    iscore += (s->lambda2*(get_rac_count(&ic)-base_bits))>>FF_LAMBDA_SHIFT;
+        ic.put_level_break(&ic, 4 + s_context, 1);
+    ic.put_block_type(&ic, 1 + left->type + top->type, 1);
+    ic.put_block_color(&ic, 32, 64, 96, l-pl, cb-pcb, cr-pcr);
+    iscore += (s->lambda2*ic.get_bits(&ic))>>FF_LAMBDA_SHIFT;
 
     av_assert1(iscore < 255*255*256 + s->lambda2*10);
     av_assert1(iscore >= 0);
@@ -358,40 +342,36 @@ static int encode_q_branch(OBMCContext *s, int level, int x, int y)
     }
 
     if(level!=s->block_max_depth){
-        put_rac(rc_s, &s->block_state[4 + s_context], 0);
+        rc->put_level_break(rc, 4 + s_context, 0);
         score2 = encode_q_branch(s, level+1, 2*x+0, 2*y+0);
         score2+= encode_q_branch(s, level+1, 2*x+1, 2*y+0);
         score2+= encode_q_branch(s, level+1, 2*x+0, 2*y+1);
         score2+= encode_q_branch(s, level+1, 2*x+1, 2*y+1);
         score2+= s->lambda2>>FF_LAMBDA_SHIFT; //FIXME exact split overhead
 
-        if(score2 < score && score2 < iscore)
+        if(score2 < score && score2 < iscore) {
+            rc->free(&ic); rc->free(&pc);
             return score2;
+        }
     }
 
     if(iscore < score){
         pred_mv(s, &pmx, &pmy, 0, left, top, tr);
-        memcpy(pbbak, i_buffer, i_len);
-        *rc_s= ic;
-        rc_s->bytestream_start= pbbak_start;
-        rc_s->bytestream= pbbak + i_len;
+        rc->copy_coder(&ic);
         set_blocks(s, level, x, y, l, cb, cr, pmx, pmy, 0, BLOCK_INTRA);
-        memcpy(s->block_state, i_state, sizeof(s->block_state));
+        rc->free(&ic); rc->free(&pc);
         return iscore;
     }else{
-        memcpy(pbbak, p_buffer, p_len);
-        *rc_s= pc;
-        rc_s->bytestream_start= pbbak_start;
-        rc_s->bytestream= pbbak + p_len;
+        rc->copy_coder(&pc);
         set_blocks(s, level, x, y, pl, pcb, pcr, mx, my, best_ref, 0);
-        memcpy(s->block_state, p_state, sizeof(s->block_state));
+        rc->free(&ic); rc->free(&pc);
         return score;
     }
 }
 
 static void encode_q_branch2(OBMCContext *s, int level, int x, int y)
 {
-    RangeCoder *const rc_s = s->c;
+    ObmcCoderContext *const rc = &s->obmc_coder;
     const int w= s->b_width  << s->block_max_depth;
     const int rem_depth= s->block_max_depth - level;
     const int index= (x + y*w) << rem_depth;
@@ -417,9 +397,9 @@ static void encode_q_branch2(OBMCContext *s, int level, int x, int y)
 
     if(level!=s->block_max_depth){
         if(same_block(b,b+1) && same_block(b,b+w) && same_block(b,b+w+1)){
-            put_rac(rc_s, &s->block_state[4 + s_context], 1);
+            rc->put_level_break(rc, 4 + s_context, 1);
         }else{
-            put_rac(rc_s, &s->block_state[4 + s_context], 0);
+            rc->put_level_break(rc, 4 + s_context, 0);
             encode_q_branch2(s, level+1, 2*x+0, 2*y+0);
             encode_q_branch2(s, level+1, 2*x+1, 2*y+0);
             encode_q_branch2(s, level+1, 2*x+0, 2*y+1);
@@ -429,20 +409,22 @@ static void encode_q_branch2(OBMCContext *s, int level, int x, int y)
     }
     if(b->type & BLOCK_INTRA){
         pred_mv(s, &pmx, &pmy, 0, left, top, tr);
-        put_rac(rc_s, &s->block_state[1 + (left->type&1) + (top->type&1)], 1);
-        s->put_symbol(rc_s, &s->block_state[32], b->color[0]-pl , 1);
-        if (s->nb_planes > 2) {
-            s->put_symbol(rc_s, &s->block_state[64], b->color[1]-pcb, 1);
-            s->put_symbol(rc_s, &s->block_state[96], b->color[2]-pcr, 1);
-        }
+        rc->put_block_type(rc, 1 + (left->type&1) + (top->type&1), 1);
+        rc->put_block_color(
+            rc,
+            32, 64, 96,
+            b->color[0]-pl, b->color[1]-pcb, b->color[2]-pcr
+        );
         set_blocks(s, level, x, y, b->color[0], b->color[1], b->color[2], pmx, pmy, 0, BLOCK_INTRA);
     }else{
         pred_mv(s, &pmx, &pmy, b->ref, left, top, tr);
-        put_rac(rc_s, &s->block_state[1 + (left->type&1) + (top->type&1)], 0);
+        rc->put_block_type(rc, 1 + (left->type&1) + (top->type&1), 0);
         if(s->ref_frames > 1)
-            s->put_symbol(rc_s, &s->block_state[128 + 1024 + 32*ref_context], b->ref, 0);
-        s->put_symbol(rc_s, &s->block_state[128 + 32*mx_context], b->mx - pmx, 1);
-        s->put_symbol(rc_s, &s->block_state[128 + 32*my_context], b->my - pmy, 1);
+            rc->put_best_ref(rc, 128 + 1024 + 32*ref_context, b->ref);
+        rc->put_block_mv(rc,
+            128 + 32*mx_context, 128 + 32*my_context,
+            b->mx - pmx, b->my - pmy
+        );
         set_blocks(s, level, x, y, pl, pcb, pcr, b->mx, b->my, b->ref, 0);
     }
 }
@@ -813,14 +795,13 @@ static void iterative_me(OBMCContext *s){
     int color[3];
 
     {
-        RangeCoder r = *s->c;
-        uint8_t state[sizeof(s->block_state)];
-        memcpy(state, s->block_state, sizeof(s->block_state));
+        ObmcCoderContext r;
+        s->obmc_coder.init_frame_coder(s->avctx, &r);
         for(mb_y= 0; mb_y<s->b_height; mb_y++)
             for(mb_x= 0; mb_x<s->b_width; mb_x++)
                 encode_q_branch(s, 0, mb_x, mb_y);
-        *s->c = r;
-        memcpy(s->block_state, state, sizeof(s->block_state));
+        s->obmc_coder.reset_coder(&r);
+        s->obmc_coder.free(&r);
     }
 
     for(pass=0; pass<25; pass++){
@@ -1036,13 +1017,15 @@ static void encode_blocks(OBMCContext *s, int search){
     int x, y;
     int w= s->b_width;
     int h= s->b_height;
-    RangeCoder *const c = s->c;
+    //RangeCoder *const c = s->c;
+    ObmcCoderContext *const c = &s->obmc_coder;
 
     if(s->motion_est == FF_ME_ITER && !s->key_frame && search)
         iterative_me(s);
 
     for(y=0; y<h; y++){
-        if(c->bytestream_end - c->bytestream < w*MB_SIZE*MB_SIZE*3){ //FIXME nicer limit
+        //if(c->bytestream_end - c->bytestream < w*MB_SIZE*MB_SIZE*3){ //FIXME nicer limit
+        if(c->available_bytes(c) < w*MB_SIZE*MB_SIZE*3){ //FIXME nicer limit
             av_log(s->avctx, AV_LOG_ERROR, "encoded frame too large\n");
             return;
         }

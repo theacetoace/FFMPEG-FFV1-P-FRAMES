@@ -32,6 +32,7 @@
 #include "rangecoder.h"
 #include "mathops.h"
 
+#define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(SnowContext, obmc.m))
 #include "obmc.h"
 
 #define MID_STATE 128
@@ -67,21 +68,9 @@ typedef struct SnowContext{
     AVClass *class;
     AVCodecContext *avctx;
     RangeCoder c;
-    //MECmpContext mecc;
-    //HpelDSPContext hdsp;
-    //QpelDSPContext qdsp;
-    //VideoDSPContext vdsp;
-    //H264QpelContext h264qpel;
-    //MpegvideoEncDSPContext mpvencdsp;
-    SnowDWTContext dwt;
-    //AVFrame *input_picture;              ///< new_picture with the internal linesizes
-    //AVFrame *current_picture;
-    //AVFrame *last_picture[MAX_REF_FRAMES];
-    //uint8_t *halfpel_plane[MAX_REF_FRAMES][4][4];
-    //AVFrame *mconly_picture;
 //     uint8_t q_context[16];
     uint8_t header_state[32];
-    //uint8_t block_state[128 + 32*128];
+    uint8_t block_state[128 + 32*128];
     int keyframe;
     int always_reset;
     int version;
@@ -91,10 +80,6 @@ typedef struct SnowContext{
     int spatial_decomposition_count;
     int last_spatial_decomposition_count;
     int temporal_decomposition_count;
-    //int max_ref_frames;
-    //int ref_frames;
-    //int16_t (*ref_mvs[MAX_REF_FRAMES])[2];
-    //uint32_t *ref_scores[MAX_REF_FRAMES];
     DWTELEM *spatial_dwt_buffer;
     DWTELEM *temp_dwt_buffer;
     //IDWTELEM *spatial_idwt_buffer;
@@ -106,45 +91,22 @@ typedef struct SnowContext{
     int spatial_scalability;
     int qlog;
     int last_qlog;
-    //int lambda;
-    //int lambda2;
     int pass1_rc;
-    //int mv_scale;
-    //int last_mv_scale;
     int qbias;
     int last_qbias;
 #define QBIAS_SHIFT 3
-    //int b_width;
-    //int b_height;
-    //int block_max_depth;
-    //int last_block_max_depth;
     int nb_planes;
     Plane plane[MAX_PLANES];
-    //BlockNode *block;
-//#define ME_CACHE_SIZE 1024
-    //unsigned me_cache[ME_CACHE_SIZE];
-    //unsigned me_cache_generation;
     slice_buffer sb;
     int memc_only;
     int no_bitstream;
-    //int intra_penalty;
-    //int motion_est;
-    //int iterative_dia_size;
     int scenechange_threshold;
-
-    //MpegEncContext m; // needed for motion estimation, should not be used for anything else, the idea is to eventually make the motion estimation independent of MpegEncContext, so this will be removed then (FIXME/XXX)
-
-    //uint8_t *scratchbuf;
-    //uint8_t *emu_edge_buffer;
-
-    //AVMotionVector *avmv;
-    //int avmv_index;
+    
     uint64_t encoding_error[AV_NUM_DATA_POINTERS];
     
     OBMCContext obmc;
 
-    int pred;
-    
+    int pred;    
 }SnowContext;
 
 /* C bits used by mmx/sse2/altivec */

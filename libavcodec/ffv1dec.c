@@ -166,6 +166,56 @@ static inline int get_vlc_symbol(GetBitContext *gb, VlcState *const state,
     return ret;
 }
 
+static int  get_level_break (ObmcCoderContext *c, int ctx)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    return get_rac(rc, &f->block_state[ctx]);
+}
+
+static int  get_block_type  (ObmcCoderContext *c, int ctx)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    return get_rac(rc, &f->block_state[ctx]);
+}
+
+static void get_block_color (ObmcCoderContext *c, int ctx_l, int ctx_cb, int ctx_cr, int *l, int *cb, int *cr)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    *l += get_symbol(rc, &f->block_state[ctx_l], 1);
+    if (f->obmc.nb_planes > 2) {
+        *cb += get_symbol(rc, &f->block_state[ctx_cb], 1);
+        *cr += get_symbol(rc, &f->block_state[ctx_cr], 1);
+    }
+}
+
+static int  get_best_ref    (ObmcCoderContext *c, int ctx)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    return get_symbol(rc, &f->block_state[ctx], 0);
+}
+
+static void get_block_mv    (ObmcCoderContext *c, int ctx_mx, int ctx_my, int *mx, int *my)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    *mx += get_symbol(rc, &f->block_state[ctx_mx], 1);
+    *my += get_symbol(rc, &f->block_state[ctx_my], 1);
+}
+
+static void ff_ffv1_init_decode_callbacks(ObmcCoderContext *c, AVCodecContext *avctx)
+{
+    c->avctx = avctx;
+    c->get_level_break = get_level_break;
+    c->get_block_type  = get_block_type;
+    c->get_block_color = get_block_color;
+    c->get_best_ref    = get_best_ref;
+    c->get_block_mv    = get_block_mv;
+}
+
 static av_always_inline void decode_line(FFV1Context *s, int w,
                                          int16_t *sample[2],
                                          int plane_index, int bits)
@@ -867,8 +917,7 @@ static int read_header(FFV1Context *f)
     }
     
     obmc_decode_init(&f->obmc);
-    f->obmc.c = &f->slice_context[0]->c;
-    f->obmc.get_symbol = get_symbol;
+    ff_ffv1_init_decode_callbacks(&f->obmc.obmc_coder, f->avctx);
 
     ff_dlog(f->avctx, "%d %d %d\n",
             f->chroma_h_shift, f->chroma_v_shift, f->avctx->pix_fmt);
@@ -964,7 +1013,7 @@ static int decode_p_header(FFV1Context *f)
     memset(state, 128, sizeof(state));
     
     if (f->key_frame) {
-        ff_obmc_reset_contexts(&f->obmc);
+        memset(f->block_state, MID_STATE, sizeof(f->block_state));
         f->obmc.max_ref_frames = get_symbol(c, state, 0) + 1;
     }
     if (!f->key_frame) {
@@ -1257,7 +1306,7 @@ static int init_thread_copy(AVCodecContext *avctx)
 
     f->obmc.block = av_mallocz_array(w * h,  sizeof(BlockNode) << 2); // FIXME Maybe large
     
-    f->obmc.c = &f->slice_context[0]->c;
+    ff_ffv1_init_decode_callbacks(&f->obmc.obmc_coder, avctx);
     f->obmc.avctx = avctx;
     
     f->obmc.chroma_h_shift = f->chroma_h_shift;
@@ -1352,7 +1401,7 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
         fdst->obmc.emu_edge_buffer = emu_edge_buffer;
         fdst->obmc.spatial_idwt_buffer = spatial_idwt_buffer;
         
-        fdst->obmc.c = &fdst->slice_context[0]->c;
+        ff_ffv1_init_decode_callbacks(&fdst->obmc.obmc_coder, dst);
         fdst->obmc.avctx = dst;
 
         for (i = 0; i<fdst->num_h_slices * fdst->num_v_slices; i++) {

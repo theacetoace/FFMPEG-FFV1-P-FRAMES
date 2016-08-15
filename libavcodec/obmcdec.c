@@ -34,7 +34,7 @@ int obmc_decode_init(OBMCContext *f) {
 }
 
 static int decode_q_branch(OBMCContext *s, int level, int x, int y){
-    RangeCoder *const c = s->c;
+    ObmcCoderContext *const c = &s->obmc_coder;
     const int w= s->b_width << s->block_max_depth;
     const int rem_depth= s->block_max_depth - level;
     const int index= (x + y*w) << rem_depth;
@@ -51,7 +51,7 @@ static int decode_q_branch(OBMCContext *s, int level, int x, int y){
         return 0;
     }
 
-    if(level==s->block_max_depth || get_rac(c, &s->block_state[4 + s_context])){
+    if(level==s->block_max_depth || c->get_level_break(c, 4 + s_context)){
         int type, mx, my;
         int l = left->color[0];
         int cb= left->color[1];
@@ -61,25 +61,23 @@ static int decode_q_branch(OBMCContext *s, int level, int x, int y){
         int mx_context= av_log2(2*FFABS(left->mx - top->mx)) + 0*av_log2(2*FFABS(tr->mx - top->mx));
         int my_context= av_log2(2*FFABS(left->my - top->my)) + 0*av_log2(2*FFABS(tr->my - top->my));
 
-        type= get_rac(c, &s->block_state[1 + left->type + top->type]) ? BLOCK_INTRA : 0;
+        type= c->get_block_type(c, 1 + left->type + top->type) ? BLOCK_INTRA : 0;
 
         if(type){
             pred_mv(s, &mx, &my, 0, left, top, tr);
-            l += s->get_symbol(c, &s->block_state[32], 1);
-            if (s->nb_planes > 2) {
-                cb+= s->get_symbol(c, &s->block_state[64], 1);
-                cr+= s->get_symbol(c, &s->block_state[96], 1);
-            }
+            c->get_block_color(c, 32, 64, 96, &l, &cb, &cr);
         }else{
             if(s->ref_frames > 1)
-                ref= s->get_symbol(c, &s->block_state[128 + 1024 + 32*ref_context], 0);
+                ref= c->get_best_ref(c, 128 + 1024 + 32*ref_context);
             if (ref >= s->ref_frames) {
                 av_log(s->avctx, AV_LOG_ERROR, "Invalid ref\n");
                 return AVERROR_INVALIDDATA;
             }
             pred_mv(s, &mx, &my, ref, left, top, tr);
-            mx+= s->get_symbol(c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
-            my+= s->get_symbol(c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
+            c->get_block_mv(c, 
+                128 + 32*(mx_context + 16*!!ref), 128 + 32*(my_context + 16*!!ref),
+                &mx, &my
+            );
         }
         set_blocks(s, level, x, y, l, cb, cr, mx, my, ref, type);
     }else{

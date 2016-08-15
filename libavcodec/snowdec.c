@@ -34,6 +34,52 @@
 
 #include "obmcdec.h"
 
+static int  get_level_break (ObmcCoderContext *c, int ctx)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    return get_rac(&f->c, &f->block_state[ctx]);
+}
+
+static int  get_block_type  (ObmcCoderContext *c, int ctx)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    return get_rac(&f->c, &f->block_state[ctx]);
+}
+
+static void get_block_color (ObmcCoderContext *c, int ctx_l, int ctx_cb, int ctx_cr, int *l, int *cb, int *cr)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    *l += get_symbol(&f->c, &f->block_state[ctx_l], 1);
+    if (f->obmc.nb_planes > 2) {
+        *cb += get_symbol(&f->c, &f->block_state[ctx_cb], 1);
+        *cr += get_symbol(&f->c, &f->block_state[ctx_cr], 1);
+    }
+}
+
+static int  get_best_ref    (ObmcCoderContext *c, int ctx)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    return get_symbol(&f->c, &f->block_state[ctx], 0);
+}
+
+static void get_block_mv    (ObmcCoderContext *c, int ctx_mx, int ctx_my, int *mx, int *my)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    *mx += get_symbol(&f->c, &f->block_state[ctx_mx], 1);
+    *my += get_symbol(&f->c, &f->block_state[ctx_my], 1);
+}
+
+static void ff_snow_init_decode_callbacks(ObmcCoderContext *c, AVCodecContext *avctx)
+{
+    c->avctx = avctx;
+    c->get_level_break = get_level_break;
+    c->get_block_type  = get_block_type;
+    c->get_block_color = get_block_color;
+    c->get_best_ref    = get_best_ref;
+    c->get_block_mv    = get_block_mv;
+}
+
+
 static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, slice_buffer * sb, int start_y, int h, int save_state[1]){
     const int w= b->width;
     int y;
@@ -260,8 +306,7 @@ static int decode_header(SnowContext *s){
     }
     
     obmc_decode_init(&s->obmc);
-    s->obmc.c = &s->c;
-    s->obmc.get_symbol = get_symbol;
+    ff_snow_init_decode_callbacks(&s->obmc.obmc_coder, s->avctx);
 
     return 0;
 }
@@ -300,10 +345,10 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     // realloc slice buffer for the case that spatial_decomposition_count changed
     ff_slice_buffer_destroy(&s->sb);
-    if ((res = ff_slice_buffer_init(&s->sb, s->plane[0].height,
+    if ((res = ff_slice_buffer_init(&s->sb, s->obmc.plane[0].height,
                                     (MB_SIZE >> s->obmc.block_max_depth) +
                                     s->spatial_decomposition_count * 11 + 1,
-                                    s->plane[0].width,
+                                    s->obmc.plane[0].width,
                                     s->obmc.spatial_idwt_buffer)) < 0)
         return res;
 
@@ -401,7 +446,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             }
 
             for(; yd<slice_h; yd+=4){
-                ff_spatial_idwt_buffered_slice(&s->dwt, cs, &s->sb, s->temp_idwt_buffer, w, h, 1, s->spatial_decomposition_type, s->spatial_decomposition_count, yd);
+                ff_spatial_idwt_buffered_slice(&s->obmc.dwt, cs, &s->sb, s->temp_idwt_buffer, w, h, 1, s->spatial_decomposition_type, s->spatial_decomposition_count, yd);
             }
 
             if(s->qlog == LOSSLESS_QLOG){

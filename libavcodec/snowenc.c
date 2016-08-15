@@ -30,12 +30,169 @@
 #include "rangecoder.h"
 #include "mathops.h"
 
-#include "mpegvideo.h"
-#include "h263.h"
+//#include "mpegvideo.h"
+//#include "h263.h"
 
 #include "obmcenc.h"
 
 #define FF_ME_ITER 50
+
+typedef struct RangeEncoderContext {
+    RangeCoder c;
+    uint8_t buffer[1024];
+    uint8_t state[128 + 32*128];
+    uint8_t *pbbak;
+    uint8_t *pbbak_start;
+    int base_bits;
+} RangeEncoderContext;
+
+static void ff_snow_init_encode_callbacks(ObmcCoderContext *, AVCodecContext *);
+
+static void init_frame_encoder(AVCodecContext *avctx, ObmcCoderContext *c)
+{
+    SnowContext *f = (SnowContext *)avctx->priv_data;
+    RangeEncoderContext *coder = av_mallocz(sizeof(RangeEncoderContext));
+    c->priv_data = coder;
+    
+    coder->pbbak = f->c.bytestream;
+    coder->pbbak_start = f->c.bytestream_start;
+    coder->base_bits = get_rac_count(&f->c) - 8*(f->c.bytestream - f->c.bytestream_start);
+    coder->c = f->c;
+    coder->c.bytestream_start = coder->c.bytestream= coder->buffer; //FIXME end/start? and at the other stoo
+    memcpy(coder->state, f->block_state, sizeof(f->block_state));
+    
+    ff_snow_init_encode_callbacks(c, avctx);
+}
+
+static void free_coder (ObmcCoderContext *c)
+{
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        av_freep(&coder);
+    }
+}
+
+static void copy_coder        (struct ObmcCoderContext *c)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    
+    int len = coder->c.bytestream - coder->c.bytestream_start;
+    
+    memcpy(coder->pbbak, coder->buffer, len);
+    f->c = coder->c;
+    f->c.bytestream_start= coder->pbbak_start;
+    f->c.bytestream= coder->pbbak + len;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+static void reset_coder      (struct ObmcCoderContext *c)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    
+    f->c = coder->c;
+    f->c.bytestream_start= coder->pbbak_start;
+    f->c.bytestream= coder->pbbak;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+#define SET_IF_CODER(c)                                                         \
+    do {                                                                        \
+        if (c->priv_data) {                                                     \
+            RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;   \
+            rc = &coder->c; state = coder->state;                               \
+        }                                                                       \
+    } while (0)
+
+static void put_level_break (struct ObmcCoderContext *c, int ctx, int v)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_rac(rc, &state[ctx], v);
+}
+
+static void put_block_type  (struct ObmcCoderContext *c, int ctx, int type) 
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_rac(rc, &state[ctx], type);
+}
+
+static void put_best_ref    (struct ObmcCoderContext *c, int ctx, int best_ref)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx], best_ref, 0);
+}
+
+static void put_block_mv    (struct ObmcCoderContext *c, int ctx_mx, int ctx_my, int mx, int my)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx_mx], mx, 1);
+    put_symbol(rc, &state[ctx_my], my, 1);
+}
+
+static void put_block_color (struct ObmcCoderContext *c, int ctx_l, int ctx_cb, int ctx_cr, int l, int cb, int cr)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    put_symbol(rc, &state[ctx_l],  l , 1);
+    if (f->obmc.nb_planes > 2) {
+        put_symbol(rc, &state[ctx_cb], cb, 1);
+        put_symbol(rc, &state[ctx_cr], cr, 1);
+    }
+}
+
+static int get_coder_bits(ObmcCoderContext *c)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    int base_bits = get_rac_count(&f->c) - 8*(f->c.bytestream - f->c.bytestream_start);
+    SET_IF_CODER(c);
+    return get_rac_count(rc) - base_bits;
+}
+
+static int get_coder_available_bytes(ObmcCoderContext *c)
+{
+    SnowContext *f = (SnowContext *)c->avctx->priv_data;
+    RangeCoder *rc = &f->c;
+    uint8_t *state = f->block_state;
+    SET_IF_CODER(c);
+    return rc->bytestream_end - rc->bytestream;
+}
+
+#undef SET_IF_CODER
+
+static void ff_snow_init_encode_callbacks(ObmcCoderContext *c, AVCodecContext *avctx)
+{
+    c->avctx = avctx;
+    c->put_level_break = put_level_break;
+    c->put_block_type  = put_block_type;
+    c->put_block_color = put_block_color;
+    c->put_best_ref    = put_best_ref;
+    c->put_block_mv    = put_block_mv;
+    
+    c->init_frame_coder = init_frame_encoder;
+    c->reset_coder      = reset_coder;
+    c->copy_coder       = copy_coder;
+    c->free             = free_coder;
+    
+    c->get_bits         = get_coder_bits;
+    c->available_bytes  = get_coder_available_bytes;
+}
 
 static av_cold int encode_init(AVCodecContext *avctx)
 {
@@ -100,8 +257,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
     avcodec_get_chroma_sub_sample(avctx->pix_fmt, &s->chroma_h_shift, &s->chroma_v_shift);
     
     obmc_encode_init(&s->obmc, avctx);
-    s->obmc.c = &s->c;
-    s->obmc.put_symbol = put_symbol;
+    ff_snow_init_encode_callbacks(&s->obmc.obmc_coder, avctx);
 
     return 0;
 }
@@ -563,7 +719,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     const int height= s->avctx->height;
     int level, orientation, plane_index, i, y, ret;
     uint8_t rc_header_bak[sizeof(s->header_state)];
-    uint8_t rc_block_bak[sizeof(s->obmc.block_state)];
+    uint8_t rc_block_bak[sizeof(s->block_state)];
 
     if ((ret = ff_alloc_packet2(avctx, pkt, s->obmc.b_width*s->obmc.b_height*MB_SIZE*MB_SIZE*3 + AV_INPUT_BUFFER_MIN_SIZE, 0)) < 0)
         return ret;
@@ -618,7 +774,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     if(s->pass1_rc){
         memcpy(rc_header_bak, s->header_state, sizeof(s->header_state));
-        memcpy(rc_block_bak, s->obmc.block_state, sizeof(s->obmc.block_state));
+        memcpy(rc_block_bak, s->block_state, sizeof(s->block_state));
     }
     
     obmc_pre_encode_frame(&s->obmc, avctx, pict);
@@ -713,7 +869,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
                     //reordering qlog in the bitstream would eliminate this reset
                     ff_init_range_encoder(c, pkt->data, pkt->size);
                     memcpy(s->header_state, rc_header_bak, sizeof(s->header_state));
-                    memcpy(s->obmc.block_state, rc_block_bak, sizeof(s->obmc.block_state));
+                    memcpy(s->block_state, rc_block_bak, sizeof(s->block_state));
                     encode_header(s);
                     obmc_encode_blocks(&s->obmc, 0);
                 }

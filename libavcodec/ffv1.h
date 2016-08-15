@@ -42,8 +42,9 @@
 #include "rangecoder.h"
 #include "thread.h"
 
-#define USE_HALFPEL_PLANE 1
+#define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(FFV1Context, obmc.m))
 #include "obmc.h"
+
 
 #ifdef __INTEL_COMPILER
 #undef av_flatten
@@ -144,6 +145,7 @@ typedef struct FFV1Context {
     int slice_rct_ry_coef;
     
     OBMCContext obmc;
+    uint8_t block_state[128 + 32*128];
 } FFV1Context;
 
 int ff_ffv1_common_init(AVCodecContext *avctx);
