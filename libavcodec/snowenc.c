@@ -228,11 +228,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
         if (!avctx->stats_out)
             return AVERROR(ENOMEM);
     }
-    if((avctx->flags&AV_CODEC_FLAG_PASS2) || !(avctx->flags&CODEC_FLAG_QSCALE)){
-        if(ff_rate_control_init(&s->obmc.m) < 0)
-            return -1;
-    }
-    s->pass1_rc= !(avctx->flags & (AV_CODEC_FLAG_QSCALE|CODEC_FLAG_PASS2));
 
     switch(avctx->pix_fmt){
     case AV_PIX_FMT_YUV444P:
@@ -258,6 +253,12 @@ FF_ENABLE_DEPRECATION_WARNINGS
     
     obmc_encode_init(&s->obmc, avctx);
     ff_snow_init_encode_callbacks(&s->obmc.obmc_coder, avctx);
+    
+    if((avctx->flags&AV_CODEC_FLAG_PASS2) || !(avctx->flags&CODEC_FLAG_QSCALE)){
+        if(ff_rate_control_init(&s->obmc.m) < 0)
+            return -1;
+    }
+    s->pass1_rc= !(avctx->flags & (AV_CODEC_FLAG_QSCALE|CODEC_FLAG_PASS2));
 
     return 0;
 }
