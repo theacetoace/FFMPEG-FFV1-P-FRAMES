@@ -32,12 +32,14 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/timer.h"
-
 #include "avcodec.h"
 #include "internal.h"
 #include "rangecoder.h"
+#include "golomb.h"
 #include "mathops.h"
 #include "ffv1.h"
+#include "me_cmp.h"
+#include "h263.h"
 
 av_cold int ff_ffv1_common_init(AVCodecContext *avctx)
 {
@@ -49,19 +51,35 @@ av_cold int ff_ffv1_common_init(AVCodecContext *avctx)
     s->avctx = avctx;
     s->flags = avctx->flags;
 
+    int width, height;
+
+    width = avctx->width;
+    height = avctx->height;
+
+    /* new end */
     s->picture.f = av_frame_alloc();
     s->last_picture.f = av_frame_alloc();
-    if (!s->picture.f || !s->last_picture.f)
-        return AVERROR(ENOMEM);
+    s->residual.f = av_frame_alloc();
+    if (!s->picture.f || !s->last_picture.f || !s->residual.f)
+        goto fail;
 
     s->width  = avctx->width;
     s->height = avctx->height;
+
+    s->c_image_line_buf = av_mallocz_array(sizeof(*s->c_image_line_buf), 2 * s->width);
+    s->p_image_line_buf = av_mallocz_array(sizeof(*s->p_image_line_buf), 2 * s->width);
+    if (!s->c_image_line_buf || !s->p_image_line_buf)
+        goto fail;
 
     // defaults
     s->num_h_slices = 1;
     s->num_v_slices = 1;
 
+    ff_obmc_common_init(&s->obmc, avctx);
+
     return 0;
+fail:
+    return AVERROR(ENOMEM);
 }
 
 av_cold int ff_ffv1_init_slice_state(FFV1Context *f, FFV1Context *fs)
@@ -215,6 +233,10 @@ av_cold int ff_ffv1_close(AVCodecContext *avctx)
         ff_thread_release_buffer(avctx, &s->last_picture);
     av_frame_free(&s->last_picture.f);
 
+    if (s->residual.f)
+        ff_thread_release_buffer(avctx, &s->residual);
+    av_frame_free(&s->residual.f);
+
     for (j = 0; j < s->max_slice_count; j++) {
         FFV1Context *fs = s->slice_context[j];
         for (i = 0; i < s->plane_count; i++) {
@@ -225,6 +247,9 @@ av_cold int ff_ffv1_close(AVCodecContext *avctx)
         }
         av_freep(&fs->sample_buffer);
     }
+
+    av_freep(&s->p_image_line_buf);
+    av_freep(&s->c_image_line_buf);
 
     av_freep(&avctx->stats_out);
     for (j = 0; j < s->quant_table_count; j++) {
@@ -238,6 +263,8 @@ av_cold int ff_ffv1_close(AVCodecContext *avctx)
 
     for (i = 0; i < s->max_slice_count; i++)
         av_freep(&s->slice_context[i]);
+
+    ff_obmc_close(&s->obmc);
 
     return 0;
 }

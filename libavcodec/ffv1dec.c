@@ -39,6 +39,75 @@
 #include "mathops.h"
 #include "ffv1.h"
 
+#include "obmc.h"
+
+static int ff_predict_frame(AVCodecContext *avctx, FFV1Context *f)
+{
+    int ret, i, x, y;
+    AVFrame *curr     = f->picture.f;
+    AVFrame *prev     = f->obmc.current_picture;
+    AVFrame *residual = f->residual.f;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(prev->format);
+    int width  = f->width;
+    int height = f->height;
+    int has_plane[4] = { 0 };
+    const int cw = AV_CEIL_RSHIFT(width, desc->log2_chroma_w);
+    const int ch = AV_CEIL_RSHIFT(height, desc->log2_chroma_h);
+
+    if (f->residual.f)
+        ff_thread_release_buffer(avctx, &f->residual);
+    if ((ret = ff_thread_ref_frame(&f->residual, &f->picture)) < 0)
+        return ret;
+    if ((ret = av_frame_make_writable(f->residual.f)) < 0) {
+        ff_thread_release_buffer(avctx, &f->residual);
+        return ret;
+    }
+
+    for (i = 0; i < desc->nb_components; i++)
+        has_plane[desc->comp[i].plane] = 1;
+
+    for (i = 0; i < desc->nb_components && has_plane[i]; i++)
+        memset(residual->buf[i]->data, 0, residual->buf[i]->size * sizeof(*residual->buf[i]->data));
+
+    for (i = 0; i < desc->nb_components; i++) {
+        const int w1 = (i == 1 || i == 2) ? cw : width;
+        const int h1 = (i == 1 || i == 2) ? ch : height;
+
+        const int depth = desc->comp[i].depth;
+        const int max_val = 1 << depth;
+
+        memset(f->p_image_line_buf, 0, 2 * width * sizeof(*f->p_image_line_buf));
+        memset(f->c_image_line_buf, 0, 2 * width * sizeof(*f->c_image_line_buf));
+
+        for (y = 0; y < h1; y++) {
+            memset(f->p_image_line_buf, 0, width * sizeof(*f->p_image_line_buf));
+            memset(f->c_image_line_buf, 0, width * sizeof(*f->c_image_line_buf));
+            av_read_image_line(f->c_image_line_buf,
+                               (void *)curr->data,
+                               curr->linesize,
+                               desc,
+                               0, y, i, w1, 0);
+            av_read_image_line(f->p_image_line_buf,
+                              (void *)prev->data,
+                              prev->linesize,
+                              desc,
+                              0, y, i, w1, 0);
+            for (x = 0; x < w1; ++x) {
+                f->c_image_line_buf[x] = (f->c_image_line_buf[x] + f->p_image_line_buf[x] - (max_val >> 2)) & (max_val - 1);
+            }
+            av_write_image_line(f->c_image_line_buf,
+                                residual->data,
+                                residual->linesize,
+                                desc,
+                                0, y, i, w1);
+        }
+    }
+
+    av_frame_copy(curr, residual);
+
+    return 0;
+}
+
 static inline av_flatten int get_symbol_inline(RangeCoder *c, uint8_t *state,
                                                int is_signed)
 {
@@ -95,6 +164,82 @@ static inline int get_vlc_symbol(GetBitContext *gb, VlcState *const state,
     update_vlc_state(state, v);
 
     return ret;
+}
+
+static int decode_q_branch(FFV1Context *f, int level, int x, int y){
+    RangeCoder *const c = &f->slice_context[0]->c;
+    OBMCContext *s = &f->obmc;
+    const int w= s->b_width << s->block_max_depth;
+    const int rem_depth= s->block_max_depth - level;
+    const int index= (x + y*w) << rem_depth;
+    int trx= (x+1)<<rem_depth;
+    const BlockNode *left  = x ? &s->block[index-1] : &null_block;
+    const BlockNode *top   = y ? &s->block[index-w] : &null_block;
+    const BlockNode *tl    = y && x ? &s->block[index-w-1] : left;
+    const BlockNode *tr    = y && trx<w && ((x&1)==0 || level==0) ? &s->block[index-w+(1<<rem_depth)] : tl; //FIXME use lt
+    int s_context= 2*left->level + 2*top->level + tl->level + tr->level;
+    int res;
+
+    if(s->keyframe){
+        set_blocks(s, level, x, y, null_block.color[0], null_block.color[1], null_block.color[2], null_block.mx, null_block.my, null_block.ref, BLOCK_INTRA);
+        return 0;
+    }
+
+    if(level==s->block_max_depth || get_rac(c, &f->block_state[4 + s_context])){
+        int type, mx, my;
+        int l = left->color[0];
+        int cb= left->color[1];
+        int cr= left->color[2];
+        unsigned ref = 0;
+        int ref_context= av_log2(2*left->ref) + av_log2(2*top->ref);
+        int mx_context= av_log2(2*FFABS(left->mx - top->mx)) + 0*av_log2(2*FFABS(tr->mx - top->mx));
+        int my_context= av_log2(2*FFABS(left->my - top->my)) + 0*av_log2(2*FFABS(tr->my - top->my));
+
+        type= get_rac(c, &f->block_state[1 + left->type + top->type]) ? BLOCK_INTRA : 0;
+
+        if(type){
+            pred_mv(s, &mx, &my, 0, left, top, tr);
+            l += get_symbol(c, &f->block_state[32], 1);
+            if (f->obmc.nb_planes > 2) {
+                cb += get_symbol(c, &f->block_state[64], 1);
+                cr += get_symbol(c, &f->block_state[96], 1);
+            }
+        }else{
+            if(s->ref_frames > 1)
+                ref = get_symbol(c, &f->block_state[128 + 1024 + 32*ref_context], 0);
+            if (ref >= s->ref_frames) {
+                av_log(s->avctx, AV_LOG_ERROR, "Invalid ref\n");
+                return AVERROR_INVALIDDATA;
+            }
+            pred_mv(s, &mx, &my, ref, left, top, tr);
+            mx += get_symbol(c, &f->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
+            my += get_symbol(c, &f->block_state[128 + 32*(my_context + 16*!!ref)], 1);
+        }
+        set_blocks(s, level, x, y, l, cb, cr, mx, my, ref, type);
+    }else{
+        if ((res = decode_q_branch(f, level+1, 2*x+0, 2*y+0)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+1, 2*y+0)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+0, 2*y+1)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+1, 2*y+1)) < 0)
+            return res;
+    }
+    return 0;
+}
+
+static int decode_blocks(FFV1Context *s){
+    int x, y;
+    int w= s->obmc.b_width;
+    int h= s->obmc.b_height;
+    int res;
+
+    for(y=0; y<h; y++){
+        for(x=0; x<w; x++){
+            if ((res = decode_q_branch(s, 0, x, y)) < 0)
+                return res;
+        }
+    }
+
+    return 0;
 }
 
 static av_always_inline void decode_line(FFV1Context *s, int w,
@@ -533,6 +678,7 @@ static int read_extra_header(FFV1Context *f)
     ff_build_rac_states(c, 0.05 * (1LL << 32), 256 - 8);
 
     f->version = get_symbol(c, state, 0);
+
     if (f->version < 2) {
         av_log(f->avctx, AV_LOG_ERROR, "Invalid version in global header\n");
         return AVERROR_INVALIDDATA;
@@ -542,6 +688,13 @@ static int read_extra_header(FFV1Context *f)
         f->micro_version = get_symbol(c, state, 0);
         if (f->micro_version < 0)
             return AVERROR_INVALIDDATA;
+    }
+
+    if (f->version == 3 && f->micro_version > 4 || f->version == 4 && f->micro_version > 2) {
+        f->p_frame = 1;
+        f->micro_version--;
+    } else {
+        f->p_frame = 0;
     }
     f->ac = get_symbol(c, state, 0);
 
@@ -789,6 +942,8 @@ static int read_header(FFV1Context *f)
         return AVERROR(ENOSYS);
     }
 
+    ff_obmc_decode_init(&f->obmc);
+
     ff_dlog(f->avctx, "%d %d %d\n",
             f->chroma_h_shift, f->chroma_v_shift, f->avctx->pix_fmt);
     if (f->version < 2) {
@@ -870,6 +1025,49 @@ static int read_header(FFV1Context *f)
             }
         }
     }
+
+    return 0;
+}
+
+static int decode_p_header(FFV1Context *f)
+{
+    uint8_t state[CONTEXT_SIZE];
+    int plane_index;
+    RangeCoder *const c = &f->slice_context[0]->c;
+
+    memset(state, 128, sizeof(state));
+
+    if (f->key_frame) {
+        memset(f->block_state, MID_STATE, sizeof(f->block_state));
+        f->obmc.max_ref_frames = get_symbol(c, state, 0) + 1;
+    }
+    if (!f->key_frame) {
+        for(plane_index=0; plane_index<FFMIN(f->obmc.nb_planes, 2); plane_index++){
+            int htaps, i, sum=0;
+            PlaneObmc *p= &f->obmc.plane[plane_index];
+            p->diag_mc = get_rac(c, state);
+            htaps = get_symbol(c, state, 0)*2 + 2;
+            if((unsigned)htaps > HTAPS_MAX || htaps==0)
+                return AVERROR_INVALIDDATA;
+            p->htaps= htaps;
+            for(i= p->htaps/2; i; i--) {
+                p->hcoeff[i]= get_symbol(c, state, 0) * (1-2*(i&1));
+                sum += p->hcoeff[i];
+            }
+            p->hcoeff[0]= 32-sum;
+        }
+        f->obmc.plane[2].diag_mc= f->obmc.plane[1].diag_mc;
+        f->obmc.plane[2].htaps  = f->obmc.plane[1].htaps;
+        memcpy(f->obmc.plane[2].hcoeff, f->obmc.plane[1].hcoeff, sizeof(f->obmc.plane[1].hcoeff));
+    }
+
+    f->obmc.mv_scale       = get_symbol(c, state, 0);
+    f->obmc.block_max_depth= get_symbol(c, state, 0);
+    if(f->obmc.block_max_depth > 1 || f->obmc.block_max_depth < 0){
+        av_log(f->avctx, AV_LOG_ERROR, "block_max_depth= %d is too large\n", f->obmc.block_max_depth);
+        f->obmc.block_max_depth= 0;
+        return AVERROR_INVALIDDATA;
+    }
     return 0;
 }
 
@@ -898,7 +1096,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
     int buf_size        = avpkt->size;
     FFV1Context *f      = avctx->priv_data;
     RangeCoder *const c = &f->slice_context[0]->c;
-    int i, ret;
+    int i, ret, plane_index;
     uint8_t keystate = 128;
     uint8_t *buf_p;
     AVFrame *p;
@@ -921,12 +1119,15 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
     ff_build_rac_states(c, 0.05 * (1LL << 32), 256 - 8);
 
     p->pict_type = AV_PICTURE_TYPE_I; //FIXME I vs. P
+    f->obmc.current_picture->pict_type = AV_PICTURE_TYPE_I;
     if (get_rac(c, &keystate)) {
         p->key_frame    = 1;
+        f->obmc.keyframe = f->key_frame = 1;
         f->key_frame_ok = 0;
         if ((ret = read_header(f)) < 0)
             return ret;
         f->key_frame_ok = 1;
+
     } else {
         if (!f->key_frame_ok) {
             av_log(avctx, AV_LOG_ERROR,
@@ -934,6 +1135,17 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
             return AVERROR_INVALIDDATA;
         }
         p->key_frame = 0;
+        f->obmc.keyframe = f->key_frame = 0;
+    }
+
+    if (f->p_frame) {
+        if ((ret = decode_p_header(f)) < 0)
+            return ret;
+
+        p->pict_type = p->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
+
+        if ((ret=ff_obmc_common_init_after_header(&f->obmc)) < 0)
+            return ret;
     }
 
     if ((ret = ff_thread_get_buffer(avctx, &f->picture, AV_GET_BUFFER_FLAG_REF)) < 0)
@@ -942,6 +1154,14 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
     if (avctx->debug & FF_DEBUG_PICT_INFO)
         av_log(avctx, AV_LOG_DEBUG, "ver:%d keyframe:%d coder:%d ec:%d slices:%d bps:%d\n",
                f->version, p->key_frame, f->ac, f->ec, f->slice_count, f->avctx->bits_per_raw_sample);
+
+    if (f->p_frame) {
+        if ((ret = ff_obmc_predecode_frame(&f->obmc)) < 0)
+            return ret;
+
+        if ((ret = decode_blocks(f)) < 0)
+            return ret;
+    }
 
     ff_thread_finish_setup(avctx);
 
@@ -1019,6 +1239,33 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
                           fs->slice_height);
         }
     }
+
+    if (f->p_frame) {
+        ff_thread_await_progress(&f->last_picture, INT_MAX, 0);
+
+        av_frame_copy(f->obmc.last_pictures[1], f->last_picture.f);
+
+        for(plane_index=0; plane_index < f->obmc.nb_planes; plane_index++){
+            PlaneObmc *pc= &f->obmc.plane[plane_index];
+            int w= pc->width;
+            int h= pc->height;
+
+            if(!p->key_frame){
+                memset(f->obmc.spatial_idwt_buffer, 0, sizeof(IDWTELEM)*w*h);
+                predict_plane(&f->obmc, f->obmc.spatial_idwt_buffer, plane_index, 1);
+            }
+        }
+
+        if (!p->key_frame) {
+            if ((ret = ff_predict_frame(avctx, f)) < 0) {
+                ff_thread_report_progress(&f->picture, INT_MAX, 0);
+                return ret;
+            }
+        }
+        av_frame_copy(f->obmc.current_picture, f->picture.f);
+    }
+    ff_obmc_release_buffer(&f->obmc);
+
     ff_thread_report_progress(&f->picture, INT_MAX, 0);
 
     f->picture_number++;
@@ -1026,6 +1273,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
     if (f->last_picture.f)
         ff_thread_release_buffer(avctx, &f->last_picture);
     f->cur = NULL;
+
     if ((ret = av_frame_ref(data, f->picture.f)) < 0)
         return ret;
 
@@ -1037,14 +1285,23 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 #if HAVE_THREADS
 static int init_thread_copy(AVCodecContext *avctx)
 {
+
     FFV1Context *f = avctx->priv_data;
     int i, ret;
 
     f->picture.f      = NULL;
     f->last_picture.f = NULL;
+    f->residual.f     = NULL;
     f->sample_buffer  = NULL;
     f->max_slice_count = 0;
     f->slice_count = 0;
+
+    f->obmc.current_picture = NULL;
+    for (i = 0; i < MAX_REF_FRAMES; i++)
+        f->obmc.last_pictures[i] = NULL;
+
+    f->p_image_line_buf = NULL;
+    f->c_image_line_buf = NULL;
 
     for (i = 0; i < f->quant_table_count; i++) {
         av_assert0(f->version > 1);
@@ -1054,11 +1311,47 @@ static int init_thread_copy(AVCodecContext *avctx)
 
     f->picture.f      = av_frame_alloc();
     f->last_picture.f = av_frame_alloc();
+    f->residual.f     = av_frame_alloc();
+
+    if (!f->picture.f || !f->last_picture.f || !f->residual.f)
+        goto fail;
+
+    f->obmc.current_picture = av_frame_alloc();
+    f->obmc.mconly_picture = av_frame_alloc();
+
+    f->width  = avctx->width;
+    f->height = avctx->height;
+
+    FF_ALLOCZ_ARRAY_OR_GOTO(avctx, f->obmc.spatial_idwt_buffer, f->width, f->height * sizeof(IDWTELEM), fail);
+
+    for (i = 0; i < MAX_REF_FRAMES; i++)
+        f->obmc.last_pictures[i] = av_frame_alloc();
+
+    int w= AV_CEIL_RSHIFT(avctx->width,  LOG2_MB_SIZE);
+    int h= AV_CEIL_RSHIFT(avctx->height, LOG2_MB_SIZE);
+
+    f->obmc.b_width = w;
+    f->obmc.b_height= h;
+
+    f->obmc.block = av_mallocz_array(w * h,  sizeof(BlockNode) << 2); // FIXME Maybe large
+
+    f->obmc.avctx = avctx;
+
+    f->obmc.chroma_h_shift = f->chroma_h_shift;
+    f->obmc.chroma_v_shift = f->chroma_v_shift;
+
+    f->p_image_line_buf = av_mallocz_array(sizeof(*f->p_image_line_buf), 2 * f->width);
+    f->c_image_line_buf = av_mallocz_array(sizeof(*f->c_image_line_buf), 2 * f->width);
+
+    if (!f->p_image_line_buf || !f->c_image_line_buf)
+        goto fail;
 
     if ((ret = ff_ffv1_init_slice_contexts(f)) < 0)
         return ret;
 
     return 0;
+fail:
+    return AVERROR(ENOMEM);
 }
 #endif
 
@@ -1075,6 +1368,7 @@ static void copy_fields(FFV1Context *fsdst, FFV1Context *fssrc, FFV1Context *fsr
     fsdst->colorspace          = fsrc->colorspace;
 
     fsdst->ec                  = fsrc->ec;
+    fsdst->p_frame             = fsrc->p_frame;
     fsdst->intra               = fsrc->intra;
     fsdst->slice_damaged       = fssrc->slice_damaged;
     fsdst->key_frame_ok        = fsrc->key_frame_ok;
@@ -1095,23 +1389,48 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 {
     FFV1Context *fsrc = src->priv_data;
     FFV1Context *fdst = dst->priv_data;
-    int i, ret;
+    int i, j, ret;
 
     if (dst == src)
         return 0;
 
     {
-        ThreadFrame picture = fdst->picture, last_picture = fdst->last_picture;
+        ThreadFrame picture = fdst->picture, last_picture = fdst->last_picture, residual = fdst->residual;
+        uint16_t *c_image_line_buf = fdst->c_image_line_buf, *p_image_line_buf = fdst->p_image_line_buf;
         uint8_t (*initial_states[MAX_QUANT_TABLES])[32];
         struct FFV1Context *slice_context[MAX_SLICES];
         memcpy(initial_states, fdst->initial_states, sizeof(fdst->initial_states));
         memcpy(slice_context,  fdst->slice_context , sizeof(fdst->slice_context));
+        AVFrame *current_picture = fdst->obmc.current_picture, *mconly_picture = fdst->obmc.mconly_picture;
+        AVFrame *last_pictures[MAX_REF_FRAMES];
+        BlockNode *block = fdst->obmc.block;
+        uint8_t *scratchbuf = fdst->obmc.scratchbuf;
+        uint8_t *emu_edge_buffer = fdst->obmc.emu_edge_buffer;
+        IDWTELEM *spatial_idwt_buffer = fdst->obmc.spatial_idwt_buffer;
+        for (i = 0; i < MAX_REF_FRAMES; i++)
+            last_pictures[i] = fdst->obmc.last_pictures[i];
 
         memcpy(fdst, fsrc, sizeof(*fdst));
         memcpy(fdst->initial_states, initial_states, sizeof(fdst->initial_states));
         memcpy(fdst->slice_context,  slice_context , sizeof(fdst->slice_context));
         fdst->picture      = picture;
         fdst->last_picture = last_picture;
+        fdst->residual     = residual;
+
+        fdst->p_image_line_buf = p_image_line_buf;
+        fdst->c_image_line_buf = c_image_line_buf;
+
+        fdst->obmc.current_picture   = current_picture;
+        fdst->obmc.mconly_picture    = mconly_picture;
+        for (i = 0; i < MAX_REF_FRAMES; i++)
+            fdst->obmc.last_pictures[i] = last_pictures[i];
+        fdst->obmc.block = block;
+        fdst->obmc.scratchbuf = scratchbuf;
+        fdst->obmc.emu_edge_buffer = emu_edge_buffer;
+        fdst->obmc.spatial_idwt_buffer = spatial_idwt_buffer;
+
+        fdst->obmc.avctx = dst;
+
         for (i = 0; i<fdst->num_h_slices * fdst->num_v_slices; i++) {
             FFV1Context *fssrc = fsrc->slice_context[i];
             FFV1Context *fsdst = fdst->slice_context[i];
@@ -1123,12 +1442,40 @@ static int update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 
     av_assert1(fdst->max_slice_count == fsrc->max_slice_count);
 
-
     ff_thread_release_buffer(dst, &fdst->picture);
     if (fsrc->picture.f->data[0]) {
         if ((ret = ff_thread_ref_frame(&fdst->picture, &fsrc->picture)) < 0)
             return ret;
     }
+
+    for (i = 0; i < MAX_REF_FRAMES; i++)
+        av_frame_ref(fdst->obmc.last_pictures[i], fsrc->obmc.last_pictures[i]);
+
+    av_frame_ref(fdst->obmc.current_picture, fsrc->obmc.current_picture);
+
+    for (i = 0; i < MAX_REF_FRAMES; i++) {
+        for(j=0; j<9; j++) {
+            int is_chroma= !!(j%3);
+            int h= is_chroma ? AV_CEIL_RSHIFT(fsrc->avctx->height, fsrc->chroma_v_shift) : fsrc->avctx->height;
+            int ls= fdst->obmc.last_pictures[i]->linesize[j%3];
+            if (fsrc->obmc.halfpel_plane[i][1+j/3][j%3]) {
+                fdst->obmc.halfpel_plane[i][1+j/3][j%3] = av_malloc_array(ls, (h + 2 * EDGE_WIDTH));
+                memcpy(
+                    fdst->obmc.halfpel_plane[i][1+j/3][j%3],
+                    fsrc->obmc.halfpel_plane[i][1+j/3][j%3] - EDGE_WIDTH*(1+fsrc->obmc.last_pictures[i]->linesize[j%3]),
+                    ls * (h + 2 * EDGE_WIDTH) * sizeof(*fdst->obmc.halfpel_plane[i][1+j/3][j%3])
+                );
+                fdst->obmc.halfpel_plane[i][1+j/3][j%3] += EDGE_WIDTH * (1 + ls);
+            }
+            fdst->obmc.halfpel_plane[i][0][j%3] = fdst->obmc.last_pictures[i]->data[j%3];
+        }
+    }
+
+    memcpy(
+        fdst->obmc.block,
+        fsrc->obmc.block,
+        (fsrc->obmc.b_width * fsrc->obmc.b_height * (sizeof(BlockNode) << (fsrc->obmc.block_max_depth*2)))
+    );
 
     fdst->fsrc = fsrc;
 

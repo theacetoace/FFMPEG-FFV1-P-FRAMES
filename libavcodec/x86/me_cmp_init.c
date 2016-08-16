@@ -627,7 +627,9 @@ av_cold void ff_me_cmp_init_x86(MECmpContext *c, AVCodecContext *avctx)
         c->hadamard8_diff[0] = ff_hadamard8_diff16_sse2;
         c->hadamard8_diff[1] = ff_hadamard8_diff_sse2;
 #endif
-        if (!(cpu_flags & AV_CPU_FLAG_SSE2SLOW) && avctx->codec_id != AV_CODEC_ID_SNOW) {
+        if (!(cpu_flags & AV_CPU_FLAG_SSE2SLOW) && 
+            avctx->codec_id != AV_CODEC_ID_SNOW &&
+            avctx->codec_id != AV_CODEC_ID_FFV1) {
             c->sad[0]        = ff_sad16_sse2;
             c->pix_abs[0][0] = ff_sad16_sse2;
             c->pix_abs[0][1] = ff_sad16_x2_sse2;
