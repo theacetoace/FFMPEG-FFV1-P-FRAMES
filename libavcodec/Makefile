@@ -511,9 +511,11 @@ OBJS-$(CONFIG_SMACKAUD_DECODER)        += smacker.o
 OBJS-$(CONFIG_SMACKER_DECODER)         += smacker.o
 OBJS-$(CONFIG_SMC_DECODER)             += smc.o
 OBJS-$(CONFIG_SMVJPEG_DECODER)         += smvjpegdec.o
-OBJS-$(CONFIG_SNOW_DECODER)            += snowdec.o snow.o snow_dwt.o
-OBJS-$(CONFIG_SNOW_ENCODER)            += snowenc.o snow.o snow_dwt.o             \
-                                          h263.o ituh263enc.o
+OBJS-$(CONFIG_SNOW_DECODER)            += snowdec.o snow.o snow_dwt.o\
+										  obmemc.o obmc.o
+OBJS-$(CONFIG_SNOW_ENCODER)            += snowenc.o snow.o snow_dwt.o\
+                                          h263.o ituh263enc.o\
+                                          obmemc.o obme.o
 OBJS-$(CONFIG_SOL_DPCM_DECODER)        += dpcm.o
 OBJS-$(CONFIG_SONIC_DECODER)           += sonic.o
 OBJS-$(CONFIG_SONIC_ENCODER)           += sonic.o

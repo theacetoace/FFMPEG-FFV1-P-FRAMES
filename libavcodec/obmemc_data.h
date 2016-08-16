@@ -19,10 +19,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef AVCODEC_SNOWDATA_H
-#define AVCODEC_SNOWDATA_H
+#ifndef AVCODEC_OBMEMC_DATA_H
+#define AVCODEC_OBMEMC_DATA_H
 
-#include "snow.h"
+#include "obmemc.h"
 
 static const uint8_t obmc32[1024]={
   0,  0,  0,  0,  4,  4,  4,  4,  4,  4,  4,  4,  8,  8,  8,  8,  8,  8,  8,  8,  4,  4,  4,  4,  4,  4,  4,  4,  0,  0,  0,  0,
@@ -129,4 +129,4 @@ uint8_t ff_qexp[QROOT];
 int ff_scale_mv_ref[MAX_REF_FRAMES][MAX_REF_FRAMES];
 
 
-#endif /* AVCODEC_SNOW_H */
+#endif /* AVCODEC_OBMEMC_DATA_H */

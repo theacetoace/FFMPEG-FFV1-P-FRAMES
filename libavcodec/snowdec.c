@@ -29,90 +29,7 @@
 #include "rangecoder.h"
 #include "mathops.h"
 
-#include "mpegvideo.h"
-#include "h263.h"
-
-static av_always_inline void predict_slice_buffered(SnowContext *s, slice_buffer * sb, IDWTELEM * old_buffer, int plane_index, int add, int mb_y){
-    Plane *p= &s->plane[plane_index];
-    const int mb_w= s->b_width  << s->block_max_depth;
-    const int mb_h= s->b_height << s->block_max_depth;
-    int x, y, mb_x;
-    int block_size = MB_SIZE >> s->block_max_depth;
-    int block_w    = plane_index ? block_size>>s->chroma_h_shift : block_size;
-    int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
-    const uint8_t *obmc  = plane_index ? ff_obmc_tab[s->block_max_depth+s->chroma_h_shift] : ff_obmc_tab[s->block_max_depth];
-    int obmc_stride= plane_index ? (2*block_size)>>s->chroma_h_shift : 2*block_size;
-    int ref_stride= s->current_picture->linesize[plane_index];
-    uint8_t *dst8= s->current_picture->data[plane_index];
-    int w= p->width;
-    int h= p->height;
-
-    if(s->keyframe || (s->avctx->debug&512)){
-        if(mb_y==mb_h)
-            return;
-
-        if(add){
-            for(y=block_h*mb_y; y<FFMIN(h,block_h*(mb_y+1)); y++){
-//                DWTELEM * line = slice_buffer_get_line(sb, y);
-                IDWTELEM * line = sb->line[y];
-                for(x=0; x<w; x++){
-//                    int v= buf[x + y*w] + (128<<FRAC_BITS) + (1<<(FRAC_BITS-1));
-                    int v= line[x] + (128<<FRAC_BITS) + (1<<(FRAC_BITS-1));
-                    v >>= FRAC_BITS;
-                    if(v&(~255)) v= ~(v>>31);
-                    dst8[x + y*ref_stride]= v;
-                }
-            }
-        }else{
-            for(y=block_h*mb_y; y<FFMIN(h,block_h*(mb_y+1)); y++){
-//                DWTELEM * line = slice_buffer_get_line(sb, y);
-                IDWTELEM * line = sb->line[y];
-                for(x=0; x<w; x++){
-                    line[x] -= 128 << FRAC_BITS;
-//                    buf[x + y*w]-= 128<<FRAC_BITS;
-                }
-            }
-        }
-
-        return;
-    }
-
-    for(mb_x=0; mb_x<=mb_w; mb_x++){
-        add_yblock(s, 1, sb, old_buffer, dst8, obmc,
-                   block_w*mb_x - block_w/2,
-                   block_h*mb_y - block_h/2,
-                   block_w, block_h,
-                   w, h,
-                   w, ref_stride, obmc_stride,
-                   mb_x - 1, mb_y - 1,
-                   add, 0, plane_index);
-    }
-
-    if(s->avmv && mb_y < mb_h && plane_index == 0)
-        for(mb_x=0; mb_x<mb_w; mb_x++){
-            AVMotionVector *avmv = s->avmv + s->avmv_index;
-            const int b_width = s->b_width  << s->block_max_depth;
-            const int b_stride= b_width;
-            BlockNode *bn= &s->block[mb_x + mb_y*b_stride];
-
-            if (bn->type)
-                continue;
-
-            s->avmv_index++;
-
-            avmv->w = block_w;
-            avmv->h = block_h;
-            avmv->dst_x = block_w*mb_x - block_w/2;
-            avmv->dst_y = block_h*mb_y - block_h/2;
-            avmv->motion_scale = 8;
-            avmv->motion_x = bn->mx * s->mv_scale;
-            avmv->motion_y = bn->my * s->mv_scale;
-            avmv->src_x = avmv->dst_x + avmv->motion_x / 8;
-            avmv->src_y = avmv->dst_y + avmv->motion_y / 8;
-            avmv->source= -1 - bn->ref;
-            avmv->flags = 0;
-        }
-}
+#include "obmc.h"
 
 static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, slice_buffer * sb, int start_y, int h, int save_state[1]){
     const int w= b->width;
@@ -122,7 +39,7 @@ static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, sli
     int qadd= (s->qbias*qmul)>>QBIAS_SHIFT;
     int new_index = 0;
 
-    if(b->ibuf == s->spatial_idwt_buffer || s->qlog == LOSSLESS_QLOG){
+    if(b->ibuf == s->obmc.spatial_idwt_buffer || s->qlog == LOSSLESS_QLOG){
         qadd= 0;
         qmul= 1<<QEXPSHIFT;
     }
@@ -155,7 +72,9 @@ static inline void decode_subband_slice_buffered(SnowContext *s, SubBand *b, sli
     return;
 }
 
-static int decode_q_branch(SnowContext *s, int level, int x, int y){
+static int decode_q_branch(SnowContext *f, int level, int x, int y){
+    RangeCoder *const c = &f->c;
+    OBMCContext *s = &f->obmc;
     const int w= s->b_width << s->block_max_depth;
     const int rem_depth= s->block_max_depth - level;
     const int index= (x + y*w) << rem_depth;
@@ -172,7 +91,7 @@ static int decode_q_branch(SnowContext *s, int level, int x, int y){
         return 0;
     }
 
-    if(level==s->block_max_depth || get_rac(&s->c, &s->block_state[4 + s_context])){
+    if(level==s->block_max_depth || get_rac(c, &f->block_state[4 + s_context])){
         int type, mx, my;
         int l = left->color[0];
         int cb= left->color[1];
@@ -182,32 +101,32 @@ static int decode_q_branch(SnowContext *s, int level, int x, int y){
         int mx_context= av_log2(2*FFABS(left->mx - top->mx)) + 0*av_log2(2*FFABS(tr->mx - top->mx));
         int my_context= av_log2(2*FFABS(left->my - top->my)) + 0*av_log2(2*FFABS(tr->my - top->my));
 
-        type= get_rac(&s->c, &s->block_state[1 + left->type + top->type]) ? BLOCK_INTRA : 0;
+        type= get_rac(c, &f->block_state[1 + left->type + top->type]) ? BLOCK_INTRA : 0;
 
         if(type){
             pred_mv(s, &mx, &my, 0, left, top, tr);
-            l += get_symbol(&s->c, &s->block_state[32], 1);
-            if (s->nb_planes > 2) {
-                cb+= get_symbol(&s->c, &s->block_state[64], 1);
-                cr+= get_symbol(&s->c, &s->block_state[96], 1);
+            l += get_symbol(c, &f->block_state[32], 1);
+            if (f->obmc.nb_planes > 2) {
+                cb += get_symbol(c, &f->block_state[64], 1);
+                cr += get_symbol(c, &f->block_state[96], 1);
             }
         }else{
             if(s->ref_frames > 1)
-                ref= get_symbol(&s->c, &s->block_state[128 + 1024 + 32*ref_context], 0);
+                ref = get_symbol(c, &f->block_state[128 + 1024 + 32*ref_context], 0);
             if (ref >= s->ref_frames) {
                 av_log(s->avctx, AV_LOG_ERROR, "Invalid ref\n");
                 return AVERROR_INVALIDDATA;
             }
             pred_mv(s, &mx, &my, ref, left, top, tr);
-            mx+= get_symbol(&s->c, &s->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
-            my+= get_symbol(&s->c, &s->block_state[128 + 32*(my_context + 16*!!ref)], 1);
+            mx += get_symbol(c, &f->block_state[128 + 32*(mx_context + 16*!!ref)], 1);
+            my += get_symbol(c, &f->block_state[128 + 32*(my_context + 16*!!ref)], 1);
         }
         set_blocks(s, level, x, y, l, cb, cr, mx, my, ref, type);
     }else{
-        if ((res = decode_q_branch(s, level+1, 2*x+0, 2*y+0)) < 0 ||
-            (res = decode_q_branch(s, level+1, 2*x+1, 2*y+0)) < 0 ||
-            (res = decode_q_branch(s, level+1, 2*x+0, 2*y+1)) < 0 ||
-            (res = decode_q_branch(s, level+1, 2*x+1, 2*y+1)) < 0)
+        if ((res = decode_q_branch(f, level+1, 2*x+0, 2*y+0)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+1, 2*y+0)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+0, 2*y+1)) < 0 ||
+            (res = decode_q_branch(f, level+1, 2*x+1, 2*y+1)) < 0)
             return res;
     }
     return 0;
@@ -297,13 +216,14 @@ static int decode_header(SnowContext *s){
     memset(kstate, MID_STATE, sizeof(kstate));
 
     s->keyframe= get_rac(&s->c, kstate);
+    s->obmc.keyframe = s->keyframe;
     if(s->keyframe || s->always_reset){
         ff_snow_reset_contexts(s);
         s->spatial_decomposition_type=
         s->qlog=
         s->qbias=
-        s->mv_scale=
-        s->block_max_depth= 0;
+        s->obmc.mv_scale=
+        s->obmc.block_max_depth= 0;
     }
     if(s->keyframe){
         GET_S(s->version, tmp <= 0U)
@@ -342,8 +262,8 @@ static int decode_header(SnowContext *s){
 
         s->spatial_scalability= get_rac(&s->c, s->header_state);
 //        s->rate_scalability= get_rac(&s->c, s->header_state);
-        GET_S(s->max_ref_frames, tmp < (unsigned)MAX_REF_FRAMES)
-        s->max_ref_frames++;
+        GET_S(s->obmc.max_ref_frames, tmp < (unsigned)MAX_REF_FRAMES)
+        s->obmc.max_ref_frames++;
 
         decode_qlogs(s);
     }
@@ -352,7 +272,7 @@ static int decode_header(SnowContext *s){
         if(get_rac(&s->c, s->header_state)){
             for(plane_index=0; plane_index<FFMIN(s->nb_planes, 2); plane_index++){
                 int htaps, i, sum=0;
-                Plane *p= &s->plane[plane_index];
+                PlaneObmc *p= &s->obmc.plane[plane_index];
                 p->diag_mc= get_rac(&s->c, s->header_state);
                 htaps= get_symbol(&s->c, s->header_state, 0)*2 + 2;
                 if((unsigned)htaps > HTAPS_MAX || htaps==0)
@@ -364,9 +284,9 @@ static int decode_header(SnowContext *s){
                 }
                 p->hcoeff[0]= 32-sum;
             }
-            s->plane[2].diag_mc= s->plane[1].diag_mc;
-            s->plane[2].htaps  = s->plane[1].htaps;
-            memcpy(s->plane[2].hcoeff, s->plane[1].hcoeff, sizeof(s->plane[1].hcoeff));
+            s->obmc.plane[2].diag_mc= s->obmc.plane[1].diag_mc;
+            s->obmc.plane[2].htaps  = s->obmc.plane[1].htaps;
+            memcpy(s->obmc.plane[2].hcoeff, s->obmc.plane[1].hcoeff, sizeof(s->obmc.plane[1].hcoeff));
         }
         if(get_rac(&s->c, s->header_state)){
             GET_S(s->spatial_decomposition_count, 0 < tmp && tmp <= MAX_DECOMPOSITIONS)
@@ -386,15 +306,17 @@ static int decode_header(SnowContext *s){
     }
 
 
-    s->qlog           += get_symbol(&s->c, s->header_state, 1);
-    s->mv_scale       += get_symbol(&s->c, s->header_state, 1);
-    s->qbias          += get_symbol(&s->c, s->header_state, 1);
-    s->block_max_depth+= get_symbol(&s->c, s->header_state, 1);
-    if(s->block_max_depth > 1 || s->block_max_depth < 0){
-        av_log(s->avctx, AV_LOG_ERROR, "block_max_depth= %d is too large\n", s->block_max_depth);
-        s->block_max_depth= 0;
+    s->qlog                 += get_symbol(&s->c, s->header_state, 1);
+    s->obmc.mv_scale        += get_symbol(&s->c, s->header_state, 1);
+    s->qbias                += get_symbol(&s->c, s->header_state, 1);
+    s->obmc.block_max_depth += get_symbol(&s->c, s->header_state, 1);
+    if(s->obmc.block_max_depth > 1 || s->obmc.block_max_depth < 0){
+        av_log(s->avctx, AV_LOG_ERROR, "block_max_depth= %d is too large\n", s->obmc.block_max_depth);
+        s->obmc.block_max_depth= 0;
         return AVERROR_INVALIDDATA;
     }
+
+    ff_obmc_decode_init(&s->obmc);
 
     return 0;
 }
@@ -412,8 +334,8 @@ static av_cold int decode_init(AVCodecContext *avctx)
 
 static int decode_blocks(SnowContext *s){
     int x, y;
-    int w= s->b_width;
-    int h= s->b_height;
+    int w= s->obmc.b_width;
+    int h= s->obmc.b_height;
     int res;
 
     for(y=0; y<h; y++){
@@ -422,6 +344,7 @@ static int decode_blocks(SnowContext *s){
                 return res;
         }
     }
+
     return 0;
 }
 
@@ -440,7 +363,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     ff_init_range_decoder(c, buf, buf_size);
     ff_build_rac_states(c, 0.05*(1LL<<32), 256-8);
 
-    s->current_picture->pict_type= AV_PICTURE_TYPE_I; //FIXME I vs. P
+    s->obmc.current_picture->pict_type= AV_PICTURE_TYPE_I; //FIXME I vs. P
     if ((res = decode_header(s)) < 0)
         return res;
     if ((res=ff_snow_common_init_after_header(avctx)) < 0)
@@ -448,42 +371,25 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     // realloc slice buffer for the case that spatial_decomposition_count changed
     ff_slice_buffer_destroy(&s->sb);
-    if ((res = ff_slice_buffer_init(&s->sb, s->plane[0].height,
-                                    (MB_SIZE >> s->block_max_depth) +
+    if ((res = ff_slice_buffer_init(&s->sb, s->obmc.plane[0].height,
+                                    (MB_SIZE >> s->obmc.block_max_depth) +
                                     s->spatial_decomposition_count * 11 + 1,
-                                    s->plane[0].width,
-                                    s->spatial_idwt_buffer)) < 0)
+                                    s->obmc.plane[0].width,
+                                    s->obmc.spatial_idwt_buffer)) < 0)
         return res;
-
-    for(plane_index=0; plane_index < s->nb_planes; plane_index++){
-        Plane *p= &s->plane[plane_index];
-        p->fast_mc= p->diag_mc && p->htaps==6 && p->hcoeff[0]==40
-                                              && p->hcoeff[1]==-10
-                                              && p->hcoeff[2]==2;
-    }
-
-    ff_snow_alloc_blocks(s);
-
-    if((res = ff_snow_frame_start(s)) < 0)
-        return res;
-
-    s->current_picture->pict_type = s->keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
 
     //keyframe flag duplication mess FIXME
     if(avctx->debug&FF_DEBUG_PICT_INFO)
         av_log(avctx, AV_LOG_ERROR,
                "keyframe:%d qlog:%d qbias: %d mvscale: %d "
                "decomposition_type:%d decomposition_count:%d\n",
-               s->keyframe, s->qlog, s->qbias, s->mv_scale,
+               s->keyframe, s->qlog, s->qbias, s->obmc.mv_scale,
                s->spatial_decomposition_type,
                s->spatial_decomposition_count
               );
 
-    av_assert0(!s->avmv);
-    if (s->avctx->flags2 & AV_CODEC_FLAG2_EXPORT_MVS) {
-        s->avmv = av_malloc_array(s->b_width * s->b_height, sizeof(AVMotionVector) << (s->block_max_depth*2));
-    }
-    s->avmv_index = 0;
+    if ((res = ff_obmc_predecode_frame(&s->obmc)) < 0)
+        return res;
 
     if ((res = decode_blocks(s)) < 0)
         return res;
@@ -497,12 +403,12 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
         if(s->avctx->debug&2048){
             memset(s->spatial_dwt_buffer, 0, sizeof(DWTELEM)*w*h);
-            predict_plane(s, s->spatial_idwt_buffer, plane_index, 1);
+            predict_plane(&s->obmc, s->obmc.spatial_idwt_buffer, plane_index, 1);
 
             for(y=0; y<h; y++){
                 for(x=0; x<w; x++){
-                    int v= s->current_picture->data[plane_index][y*s->current_picture->linesize[plane_index] + x];
-                    s->mconly_picture->data[plane_index][y*s->mconly_picture->linesize[plane_index] + x]= v;
+                    int v= s->obmc.current_picture->data[plane_index][y*s->obmc.current_picture->linesize[plane_index] + x];
+                    s->obmc.mconly_picture->data[plane_index][y*s->obmc.mconly_picture->linesize[plane_index] + x]= v;
                 }
             }
         }
@@ -517,8 +423,8 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
         }
 
         {
-        const int mb_h= s->b_height << s->block_max_depth;
-        const int block_size = MB_SIZE >> s->block_max_depth;
+        const int mb_h= s->obmc.b_height << s->obmc.block_max_depth;
+        const int block_size = MB_SIZE >> s->obmc.block_max_depth;
         const int block_h    = plane_index ? block_size>>s->chroma_v_shift : block_size;
         int mb_y;
         DWTCompose cs[MAX_DECOMPOSITIONS];
@@ -570,7 +476,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             }
 
             for(; yd<slice_h; yd+=4){
-                ff_spatial_idwt_buffered_slice(&s->dwt, cs, &s->sb, s->temp_idwt_buffer, w, h, 1, s->spatial_decomposition_type, s->spatial_decomposition_count, yd);
+                ff_spatial_idwt_buffered_slice(&s->obmc.dwt, cs, &s->sb, s->temp_idwt_buffer, w, h, 1, s->spatial_decomposition_type, s->spatial_decomposition_count, yd);
             }
 
             if(s->qlog == LOSSLESS_QLOG){
@@ -582,7 +488,7 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                 }
             }
 
-            predict_slice_buffered(s, &s->sb, s->spatial_idwt_buffer, plane_index, 1, mb_y);
+            predict_slice_buffered(&s->obmc, &s->sb, s->obmc.spatial_idwt_buffer, plane_index, 1, mb_y);
 
             y = FFMIN(p->height, slice_starty);
             end_y = FFMIN(p->height, slice_h);
@@ -597,22 +503,22 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     emms_c();
 
-    ff_snow_release_buffer(avctx);
+    ff_obmc_release_buffer(&s->obmc);
 
     if(!(s->avctx->debug&2048))
-        res = av_frame_ref(picture, s->current_picture);
+        res = av_frame_ref(picture, s->obmc.current_picture);
     else
-        res = av_frame_ref(picture, s->mconly_picture);
-    if (res >= 0 && s->avmv_index) {
+        res = av_frame_ref(picture, s->obmc.mconly_picture);
+    if (res >= 0 && s->obmc.avmv_index) {
         AVFrameSideData *sd;
 
-        sd = av_frame_new_side_data(picture, AV_FRAME_DATA_MOTION_VECTORS, s->avmv_index * sizeof(AVMotionVector));
+        sd = av_frame_new_side_data(picture, AV_FRAME_DATA_MOTION_VECTORS, s->obmc.avmv_index * sizeof(AVMotionVector));
         if (!sd)
             return AVERROR(ENOMEM);
-        memcpy(sd->data, s->avmv, s->avmv_index * sizeof(AVMotionVector));
+        memcpy(sd->data, s->obmc.avmv, s->obmc.avmv_index * sizeof(AVMotionVector));
     }
 
-    av_freep(&s->avmv);
+    av_freep(&s->obmc.avmv);
 
     if (res < 0)
         return res;
