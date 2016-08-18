@@ -541,6 +541,8 @@ number of bits needed for the block
 rate distortion optimal, slow
 @item zero
 0
+@item msad
+sum of median predicted absolute differences
 @item vsad
 sum of absolute vertical differences
 @item vsse
@@ -578,6 +580,8 @@ number of bits needed for the block
 rate distortion optimal, slow
 @item zero
 0
+@item msad
+sum of median predicted absolute differences
 @item vsad
 sum of absolute vertical differences
 @item vsse
