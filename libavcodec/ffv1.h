@@ -42,6 +42,11 @@
 #include "rangecoder.h"
 #include "thread.h"
 
+#define FF_MPV_OFFSET(x) (offsetof(MpegEncContext, x) + offsetof(FFV1Context, obmc.m))
+#include "obmemc.h"
+
+#define MID_STATE 128
+
 #ifdef __INTEL_COMPILER
 #undef av_flatten
 #define av_flatten
@@ -49,6 +54,7 @@
 
 #define MAX_PLANES 4
 #define CONTEXT_SIZE 32
+#define FRAC_BITS 4
 
 #define MAX_QUANT_TABLES 8
 #define MAX_CONTEXT_INPUTS 5
@@ -93,7 +99,7 @@ typedef struct FFV1Context {
     int flags;
     int picture_number;
     int key_frame;
-    ThreadFrame picture, last_picture;
+    ThreadFrame picture, last_picture, residual;
     struct FFV1Context *fsrc;
 
     AVFrame *cur;
@@ -113,11 +119,14 @@ typedef struct FFV1Context {
 
     int use32bit;
 
+    uint16_t *p_image_line_buf, *c_image_line_buf;
+
     int ec;
     int intra;
     int slice_damaged;
     int key_frame_ok;
     int context_model;
+    int p_frame;
 
     int bits_per_raw_sample;
     int packed_at_lsb;
@@ -138,6 +147,9 @@ typedef struct FFV1Context {
     int slice_coding_mode;
     int slice_rct_by_coef;
     int slice_rct_ry_coef;
+
+    OBMCContext obmc;
+    uint8_t block_state[128 + 32*128];
 } FFV1Context;
 
 int ff_ffv1_common_init(AVCodecContext *avctx);

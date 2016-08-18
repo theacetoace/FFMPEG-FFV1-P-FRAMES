@@ -41,6 +41,8 @@
 #include "mathops.h"
 #include "ffv1.h"
 
+#include "obme.h"
+
 static const int8_t quant5_10bit[256] = {
      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,
      1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
@@ -135,6 +137,75 @@ static const uint8_t ver2_state[256] = {
     226, 224, 227, 229, 240, 230, 231, 232, 233, 234, 235, 236, 238, 239, 237, 242,
     241, 243, 242, 244, 245, 246, 247, 248, 249, 250, 251, 252, 252, 253, 254, 255,
 };
+
+static int ff_frame_diff(FFV1Context *f, const AVFrame *pict)
+{
+    int ret, i, x, y;
+    AVFrame *prev     = f->obmc.current_picture;
+    AVFrame *residual = f->residual.f;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(prev->format);
+    int width  = f->width;
+    int height = f->height;
+    int has_plane[4] = { 0 };
+    const int cw = AV_CEIL_RSHIFT(width, desc->log2_chroma_w);
+    const int ch = AV_CEIL_RSHIFT(height, desc->log2_chroma_h);
+
+    if (f->picture.f)
+        av_frame_unref(f->picture.f);
+    if (f->residual.f)
+        av_frame_unref(f->residual.f);
+    if ((ret = av_frame_ref(f->residual.f, pict)) < 0)
+        return ret;
+    if ((ret = av_frame_make_writable(f->residual.f)) < 0) {
+        av_frame_unref(f->residual.f);
+        return ret;
+    }
+
+    for (i = 0; i < desc->nb_components; i++)
+        has_plane[desc->comp[i].plane] = 1;
+
+    for (i = 0; i < desc->nb_components && has_plane[i]; i++)
+        memset(residual->buf[i]->data, 0, residual->buf[i]->size * sizeof(*residual->buf[i]->data));
+
+    for (i = 0; i < desc->nb_components; i++) {
+        const int w1 = (i == 1 || i == 2) ? cw : width;
+        const int h1 = (i == 1 || i == 2) ? ch : height;
+
+        const int depth = desc->comp[i].depth;
+        const int max_val = 1 << depth;
+
+        memset(f->p_image_line_buf, 0, 2 * width * sizeof(*f->p_image_line_buf));
+        memset(f->c_image_line_buf, 0, 2 * width * sizeof(*f->c_image_line_buf));
+
+        for (y = 0; y < h1; y++) {
+            memset(f->p_image_line_buf, 0, width * sizeof(*f->p_image_line_buf));
+            memset(f->c_image_line_buf, 0, width * sizeof(*f->c_image_line_buf));
+            av_read_image_line(f->c_image_line_buf,
+                               (void *)pict->data,
+                               pict->linesize,
+                               desc,
+                               0, y, i, w1, 0);
+            av_read_image_line(f->p_image_line_buf,
+                              (void *)prev->data,
+                              prev->linesize,
+                              desc,
+                              0, y, i, w1, 0);
+            for (x = 0; x < w1; ++x) {
+                f->c_image_line_buf[x] = (f->c_image_line_buf[x] - f->p_image_line_buf[x] + (max_val >> 2)) & (max_val - 1);
+            }
+            av_write_image_line(f->c_image_line_buf,
+                                residual->data,
+                                residual->linesize,
+                                desc,
+                                0, y, i, w1);
+        }
+    }
+
+    if ((ret = av_frame_ref(f->picture.f, f->residual.f)) < 0)
+        return ret;
+
+    return 0;
+}
 
 static void find_best_state(uint8_t best_state[256][256],
                             const uint8_t one_state[256])
@@ -268,6 +339,162 @@ static inline void put_vlc_symbol(PutBitContext *pb, VlcState *const state,
     update_vlc_state(state, v);
 }
 
+typedef struct RangeEncoderContext {
+    RangeCoder c;
+    uint8_t buffer[1024];
+    uint8_t state[128 + 32*128];
+    uint8_t *pbbak;
+    uint8_t *pbbak_start;
+    int base_bits;
+} RangeEncoderContext;
+
+static void put_encoder_rac(ObmcCoderContext *c, int ctx, int v)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        rc = &coder->c;
+        state = coder->state;
+    }
+    put_rac(rc, &state[ctx], v);
+}
+
+static void put_encoder_symbol(ObmcCoderContext *c, int ctx, int v, int sign)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    uint8_t *state = f->block_state;
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        rc = &coder->c;
+        state = coder->state;
+    }
+    put_symbol(rc, &state[ctx], v, sign);
+}
+
+static void ff_ffv1_init_encode_callbacks(ObmcCoderContext *, AVCodecContext *);
+
+static void init_frame_encoder(AVCodecContext *avctx, ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = av_mallocz(sizeof(RangeEncoderContext));
+    c->priv_data = coder;
+
+    coder->pbbak = rc->bytestream;
+    coder->pbbak_start = rc->bytestream_start;
+    coder->base_bits = get_rac_count(rc) - 8*(rc->bytestream - rc->bytestream_start);
+    coder->c = *rc;
+    coder->c.bytestream_start = coder->c.bytestream = coder->buffer; //FIXME end/start? and at the other stoo
+    memcpy(coder->state, f->block_state, sizeof(f->block_state));
+
+    ff_ffv1_init_encode_callbacks(c, avctx);
+}
+
+static void free_coder(ObmcCoderContext *c)
+{
+    av_freep(&c->priv_data);
+}
+
+static void copy_coder(ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+
+    int len = coder->c.bytestream - coder->c.bytestream_start;
+
+    memcpy(coder->pbbak, coder->buffer, len);
+    *rc = coder->c;
+    rc->bytestream_start= coder->pbbak_start;
+    rc->bytestream= coder->pbbak + len;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+static void reset_coder(ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *const rc = &f->slice_context[0]->c;
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+
+    *rc = coder->c;
+    rc->bytestream_start= coder->pbbak_start;
+    rc->bytestream= coder->pbbak;
+    memcpy(f->block_state, coder->state, sizeof(f->block_state));
+}
+
+static void put_level_break(ObmcCoderContext *c, int ctx, int v)
+{
+    put_encoder_rac(c, ctx, v);
+}
+
+static void put_block_type  (struct ObmcCoderContext *c, int ctx, int type)
+{
+    put_encoder_rac(c, ctx, type);
+}
+
+static void put_best_ref    (struct ObmcCoderContext *c, int ctx, int best_ref)
+{
+    put_encoder_symbol(c, ctx, best_ref, 0);
+}
+
+static void put_block_mv    (struct ObmcCoderContext *c, int ctx_mx, int ctx_my, int mx, int my)
+{
+    put_encoder_symbol(c, ctx_mx, mx, 1);
+    put_encoder_symbol(c, ctx_my, my, 1);
+}
+
+static void put_block_color (struct ObmcCoderContext *c, int ctx_l, int ctx_cb, int ctx_cr, int l, int cb, int cr)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    put_encoder_symbol(c, ctx_l, l, 1);
+    if (f->obmc.nb_planes > 2) {
+        put_encoder_symbol(c, ctx_cb, cb, 1);
+        put_encoder_symbol(c, ctx_cr, cr, 1);
+    }
+}
+
+static int get_coder_bits(ObmcCoderContext *c)
+{
+    RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+    return get_rac_count(&coder->c) - coder->base_bits;
+}
+
+static int get_coder_available_bytes(ObmcCoderContext *c)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    RangeCoder *rc = &f->slice_context[0]->c;
+    if (c->priv_data) {
+        RangeEncoderContext *coder = (RangeEncoderContext *)c->priv_data;
+        rc = &coder->c;
+    }
+    return rc->bytestream_end - rc->bytestream;
+}
+
+static void ff_ffv1_init_encode_callbacks(ObmcCoderContext *c, AVCodecContext *avctx)
+{
+    FFV1Context *f = (FFV1Context *)c->avctx->priv_data;
+    av_assert0(sizeof(f->block_state) >= 256);
+
+    c->avctx            = avctx;
+    c->put_level_break  = put_level_break;
+    c->put_block_type   = put_block_type;
+    c->put_block_color  = put_block_color;
+    c->put_best_ref     = put_best_ref;
+    c->put_block_mv     = put_block_mv;
+
+    c->init_frame_coder = init_frame_encoder;
+    c->reset_coder      = reset_coder;
+    c->copy_coder       = copy_coder;
+    c->free             = free_coder;
+
+    c->get_bits         = get_coder_bits;
+    c->available_bytes  = get_coder_available_bytes;
+
+}
+
 #define TYPE int16_t
 #define RENAME(name) name
 #include "ffv1enc_template.c"
@@ -388,6 +615,32 @@ static void write_header(FFV1Context *f)
     }
 }
 
+static void write_p_header(FFV1Context *f)
+{
+    uint8_t state[CONTEXT_SIZE];
+    int i, plane_index;
+    RangeCoder *const c = &f->slice_context[0]->c;
+
+    memset(state, 128, sizeof(state));
+
+    if (f->key_frame) {
+        memset(f->block_state, MID_STATE, sizeof(f->block_state));
+        put_symbol(c, state, f->obmc.max_ref_frames-1, 0);
+    }
+    if (!f->key_frame) { //FIXME update_mc
+        for (plane_index=0; plane_index<FFMIN(f->obmc.nb_planes, 2); plane_index++) {
+            PlaneObmc *p= &f->obmc.plane[plane_index];
+            put_rac(c, state, p->diag_mc);
+            put_symbol(c, state, p->htaps/2-1, 0);
+            for (i = p->htaps/2; i; i--)
+                put_symbol(c, state, FFABS(p->hcoeff[i]), 0);
+        }
+    }
+
+    put_symbol(c, state, f->obmc.mv_scale, 0);
+    put_symbol(c, state, f->obmc.block_max_depth, 0);
+}
+
 static int write_extradata(FFV1Context *f)
 {
     RangeCoder *const c = &f->c;
@@ -410,9 +663,9 @@ static int write_extradata(FFV1Context *f)
     put_symbol(c, state, f->version, 0);
     if (f->version > 2) {
         if (f->version == 3) {
-            f->micro_version = 4;
+            f->micro_version = 4 + f->p_frame;
         } else if (f->version == 4)
-            f->micro_version = 2;
+            f->micro_version = 2 + f->p_frame;
         put_symbol(c, state, f->micro_version, 0);
     }
 
@@ -599,6 +852,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
             return AVERROR_INVALIDDATA;
         }
         s->version = FFMAX(s->version, 1);
+        s->p_frame = 0;
     case AV_PIX_FMT_GRAY8:
     case AV_PIX_FMT_YA8:
     case AV_PIX_FMT_YUV444P:
@@ -619,6 +873,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
             s->bits_per_raw_sample = 8;
         break;
     case AV_PIX_FMT_RGB32:
+        s->p_frame = 0;
         s->colorspace = 1;
         s->transparency = 1;
         s->chroma_planes = 1;
@@ -635,6 +890,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
         }
         break;
     case AV_PIX_FMT_0RGB32:
+        s->p_frame = 0;
         s->colorspace = 1;
         s->chroma_planes = 1;
         s->bits_per_raw_sample = 8;
@@ -666,12 +922,14 @@ FF_ENABLE_DEPRECATION_WARNINGS
             }
         }
         s->version = FFMAX(s->version, 1);
+        s->p_frame = 0;
         break;
     default:
         av_log(avctx, AV_LOG_ERROR, "format not supported\n");
         return AVERROR(ENOSYS);
     }
     av_assert0(s->bits_per_raw_sample >= 8);
+    avcodec_get_chroma_sub_sample(avctx->pix_fmt, &s->chroma_h_shift, &s->chroma_v_shift);
 
     if (s->bits_per_raw_sample > 8) {
         if (s->ac == AC_GOLOMB_RICE) {
@@ -702,6 +960,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
         ff_build_rac_states(&c, 0.05 * (1LL << 32), 256 - 8);
         for (i = 1; i < 256; i++)
             s->state_transition[i] = c.one_state[i];
+    }
+
+    if (avctx->width % 16 || avctx->height % 16) {
+        s->p_frame = 0;
     }
 
     for (i = 0; i < 256; i++) {
@@ -885,6 +1147,9 @@ slices_ok:
                     return AVERROR(ENOMEM);
             }
     }
+
+    ff_obmc_encode_init(&s->obmc, avctx);
+    ff_ffv1_init_encode_callbacks(&s->obmc.obmc_coder, avctx);
 
     return 0;
 }
@@ -1086,12 +1351,20 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                         const AVFrame *pict, int *got_packet)
 {
     FFV1Context *f      = avctx->priv_data;
+    if (f->p_frame) {
+        if (f->last_picture.f)
+            av_frame_unref(f->last_picture.f);
+        FFSWAP(ThreadFrame, f->picture, f->last_picture);
+    }
     RangeCoder *const c = &f->slice_context[0]->c;
     AVFrame *const p    = f->picture.f;
     int used_count      = 0;
     uint8_t keystate    = 128;
     uint8_t *buf_p;
-    int i, ret;
+    AVFrame *pic = NULL;
+    const int width  = f->avctx->width;
+    const int height = f->avctx->height;
+    int plane_index, i, ret;
     int64_t maxsize =   AV_INPUT_BUFFER_MIN_SIZE
                       + avctx->width*avctx->height*37LL*4;
 
@@ -1144,11 +1417,34 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     if (f->version > 3)
         maxsize = AV_INPUT_BUFFER_MIN_SIZE + avctx->width*avctx->height*3LL*4;
 
+    if (f->p_frame) {
+        maxsize += f->obmc.b_width*f->obmc.b_height*MB_SIZE*MB_SIZE*3;
+    }
+
     if ((ret = ff_alloc_packet2(avctx, pkt, maxsize, 0)) < 0)
         return ret;
 
     ff_init_range_encoder(c, pkt->data, pkt->size);
     ff_build_rac_states(c, 0.05 * (1LL << 32), 256 - 8);
+
+    if (f->p_frame) {
+        av_frame_copy(f->obmc.input_picture, pict);
+        for (i=0; i < f->obmc.nb_planes; i++)
+        {
+            int hshift = i ? f->chroma_h_shift : 0;
+            int vshift = i ? f->chroma_v_shift : 0;
+            f->obmc.mpvencdsp.draw_edges(f->obmc.input_picture->data[i], f->obmc.input_picture->linesize[i],
+                                    AV_CEIL_RSHIFT(width, hshift), AV_CEIL_RSHIFT(height, vshift),
+                                    EDGE_WIDTH >> hshift, EDGE_WIDTH >> vshift,
+                                    EDGE_TOP | EDGE_BOTTOM);
+        }
+        emms_c();
+        pic = f->obmc.input_picture;
+        pic->pict_type = pict->pict_type;
+        pic->quality = pict->quality;
+
+        f->obmc.m.picture_number= avctx->frame_number;
+    }
 
     av_frame_unref(p);
     if ((ret = av_frame_ref(p, pict)) < 0)
@@ -1162,11 +1458,64 @@ FF_ENABLE_DEPRECATION_WARNINGS
     if (avctx->gop_size == 0 || f->picture_number % avctx->gop_size == 0) {
         put_rac(c, &keystate, 1);
         f->key_frame = 1;
+        f->obmc.keyframe = 1;
         f->gob_count++;
         write_header(f);
     } else {
         put_rac(c, &keystate, 0);
         f->key_frame = 0;
+        f->obmc.keyframe = 0;
+    }
+
+    if (f->p_frame) {
+        write_p_header(f);
+
+        f->obmc.m.pict_type = pic->pict_type = f->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
+
+        ff_obmc_pre_encode_frame(&f->obmc, avctx, pict);
+
+        ff_obmc_common_init_after_header(&f->obmc);
+
+        f->obmc.m.misc_bits = 8*(c->bytestream - c->bytestream_start);
+        ff_obmc_encode_blocks(&f->obmc, 1);
+        f->obmc.m.mv_bits = 8*(c->bytestream - c->bytestream_start) - f->obmc.m.misc_bits;
+
+        for(plane_index=0; plane_index < f->obmc.nb_planes; plane_index++){
+            PlaneObmc *p= &f->obmc.plane[plane_index];
+            int w= p->width;
+            int h= p->height;
+
+            if(pic->pict_type == AV_PICTURE_TYPE_I) {
+                av_frame_copy(f->obmc.current_picture, pict);
+                break;
+            } else {
+                memset(f->obmc.spatial_idwt_buffer, 0, sizeof(IDWTELEM)*w*h);
+                predict_plane(&f->obmc, f->obmc.spatial_idwt_buffer, plane_index, 1);
+            }
+        }
+
+        if (!f->key_frame) {
+            if ((ret = ff_frame_diff(f, pict)) < 0) {
+                return ret;
+            }
+            av_frame_copy(f->obmc.current_picture, pict);
+        }
+
+        ff_obmc_release_buffer(&f->obmc);
+
+        f->obmc.current_picture->coded_picture_number = avctx->frame_number;
+        f->obmc.current_picture->pict_type = pic->pict_type;
+        f->obmc.current_picture->quality = pic->quality;
+        f->obmc.m.frame_bits = 8*(c->bytestream - c->bytestream_start);
+        f->obmc.m.p_tex_bits = f->obmc.m.frame_bits - f->obmc.m.misc_bits - f->obmc.m.mv_bits;
+        f->obmc.m.current_picture.f->display_picture_number =
+        f->obmc.m.current_picture.f->coded_picture_number   = avctx->frame_number;
+        f->obmc.m.current_picture.f->quality                = pic->quality;
+        f->obmc.m.total_bits += 8*(c->bytestream - c->bytestream_start);
+
+        f->obmc.m.last_pict_type = f->obmc.m.pict_type;
+
+        emms_c();
     }
 
     if (f->ac == AC_RANGE_CUSTOM_TAB) {
@@ -1232,19 +1581,34 @@ FF_ENABLE_DEPRECATION_WARNINGS
     pkt->flags |= AV_PKT_FLAG_KEY * f->key_frame;
     *got_packet = 1;
 
+    if (f->p_frame) {
+        if (f->picture.f)
+            av_frame_unref(f->picture.f);
+        if ((ret = av_frame_ref(f->picture.f, pict)) < 0)
+            return ret;
+        if (f->last_picture.f)
+            av_frame_unref(f->last_picture.f);
+    }
+
     return 0;
 }
 
 static av_cold int encode_close(AVCodecContext *avctx)
 {
+    FFV1Context *f = avctx->priv_data;
+
     ff_ffv1_close(avctx);
+    av_frame_free(&f->obmc.input_picture);
     return 0;
 }
 
 #define OFFSET(x) offsetof(FFV1Context, x)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
+    FF_MPV_COMMON_OPTS
+    { "iter",           NULL, 0, AV_OPT_TYPE_CONST, { .i64 = FF_ME_ITER }, 0, 0, FF_MPV_OPT_FLAGS, "motion_est" },
     { "slicecrc", "Protect slices with CRCs", OFFSET(ec), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, VE },
+    { "pframe", "Use P frames", OFFSET(p_frame), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "coder", "Coder type", OFFSET(ac), AV_OPT_TYPE_INT,
             { .i64 = 0 }, -2, 2, VE, "coder" },
         { "rice", "Golomb rice", 0, AV_OPT_TYPE_CONST,
@@ -1271,6 +1635,8 @@ static const AVClass ffv1_class = {
 #if FF_API_CODER_TYPE
 static const AVCodecDefault ffv1_defaults[] = {
     { "coder", "-1" },
+    { "me_method", "iter" },
+    { "flags", "+qpel+mv4" },
     { NULL },
 };
 #endif
