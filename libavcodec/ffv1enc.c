@@ -1637,6 +1637,8 @@ static const AVCodecDefault ffv1_defaults[] = {
     { "coder", "-1" },
     { "me_method", "iter" },
     { "flags", "+qpel+mv4" },
+    { "cmp", "msad" },
+    { "subcmp", "msad" },
     { NULL },
 };
 #endif
